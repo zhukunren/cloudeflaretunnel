@@ -1,0 +1,16 @@
+# Cloudflare Tunnel Manager - Python Requirements
+
+# YAML配置文件解析
+pyyaml>=6.0
+
+# 可选: 异步操作支持(未来功能)
+# aiohttp>=3.8.0
+# asyncio>=3.4.3
+
+# 可选: 更好的日期时间处理
+# python-dateutil>=2.8.2
+
+# 开发依赖(仅开发时需要)
+# pytest>=7.0.0
+# black>=22.0.0
+# flake8>=5.0.0

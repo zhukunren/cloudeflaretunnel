@@ -1,0 +1,35 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(find:*)",
+      "Bash(dir:*)",
+      "Bash(nul)",
+      "Bash(D:项目内网穿透cloudflared.exe --version)",
+      "Bash(\"D:\\项目\\内网穿透\\cloudflared.exe\" --version)",
+      "Bash(\"D:\\项目\\内网穿透\\cloudflared.exe\" login --help)",
+      "Bash(\"D:\\项目\\内网穿透\\cloudflared.exe\" login)",
+      "Bash(\"D:\\项目\\内网穿透\\cloudflared.exe\" tunnel list --output json)",
+      "Bash(python:*)",
+      "Bash(\"D:\\项目\\内网穿透\\cloudflared.exe\" tunnel delete --help)",
+      "Bash(tree:*)",
+      "Bash(chmod:*)",
+      "Bash(python3:*)",
+      "Bash(timeout 3 python3:*)",
+      "Bash(netstat:*)",
+      "Bash(ss:*)",
+      "Bash(journalctl:*)",
+      "Bash(curl:*)",
+      "Bash(cloudflared tunnel:*)",
+      "Bash(pkill:*)",
+      "Bash(cat:*)",
+      "Bash(pgrep:*)",
+      "Bash(xargs:*)",
+      "Bash(ps:*)",
+      "Bash(kill:*)",
+      "Bash(/home/zhukunren/桌面/项目/内网穿透/cloudflared tunnel info:*)",
+      "Bash(timeout 5 curl:*)"
+    ],
+    "deny": [],
+    "ask": []
+  }
+}

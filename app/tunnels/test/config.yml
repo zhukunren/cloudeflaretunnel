@@ -1,0 +1,9 @@
+tunnel: d46a61c2-32e7-49c0-bbae-7ec628c85359
+credentials-file: /home/zhukunren/.cloudflared/d46a61c2-32e7-49c0-bbae-7ec628c85359.json
+ingress:
+  - hostname: test.dwzq.top
+    service: http://localhost:8501
+    originRequest:
+      noTLSVerify: true
+      http2Origin: false
+  - service: http_status:404

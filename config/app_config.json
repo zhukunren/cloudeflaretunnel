@@ -1,0 +1,35 @@
+{
+  "window": {
+    "width": 1200,
+    "height": 700,
+    "min_width": 1000,
+    "min_height": 600,
+    "remember_position": true,
+    "x": 332,
+    "y": 133
+  },
+  "cloudflared": {
+    "path": "/home/zhukunren/桌面/项目/内网穿透/cloudflared",
+    "auto_find": true
+  },
+  "ui": {
+    "theme": "modern",
+    "language": "zh_CN",
+    "show_sidebar": true,
+    "compact_mode": false
+  },
+  "log": {
+    "max_lines": 1000,
+    "auto_scroll": true,
+    "show_timestamp": true,
+    "level": "info"
+  },
+  "tunnel": {
+    "auto_route_dns": true,
+    "save_last_selected": true,
+    "last_selected": "kline",
+    "persist_on_exit": true,
+    "auto_start_enabled": true,
+    "autostart_tunnel": "kline"
+  }
+}

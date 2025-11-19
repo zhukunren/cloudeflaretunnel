@@ -1,0 +1,8 @@
+tunnel: 9a4755b3-3315-40ab-b17d-fa9b9f73e474
+credentials-file: /home/zhukunren/.cloudflared/9a4755b3-3315-40ab-b17d-fa9b9f73e474.json
+protocol: http2
+no-quic: true
+ingress:
+  - hostname: test.dwzq.top
+    service: http://localhost:8501
+  - service: http_status:404

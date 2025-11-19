@@ -1,0 +1,6 @@
+tunnel: cd513082-9429-4a9d-88fa-f73c9d3b3e35
+credentials-file: C:/Users/11705/.cloudflared/cd513082-9429-4a9d-88fa-f73c9d3b3e35.json
+ingress:
+  - hostname: ceshi.dwzq.top
+    service: http://localhost:8501
+  - service: http_status:404
