@@ -1,0 +1,45 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+env/
+venv/
+.venv
+app/venv/
+*.egg-info/
+dist/
+build/
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+# Logs
+logs/*.log
+logs/persistent/*.log
+logs/tunnel_*.log
+logs/cloudflared_*.log
+*.pid
+
+# Temporary files
+*.tmp
+*.bak
+*.backup
+.DS_Store
+
+# Cloudflare credentials
+.cloudflared/
+credentials.json
+
+# Local config
+local_config.json
+*.local
+
+# Test files
+test_*.py
+*_test.py

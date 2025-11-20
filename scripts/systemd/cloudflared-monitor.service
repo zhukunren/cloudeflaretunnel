@@ -1,0 +1,40 @@
+[Unit]
+Description=Cloudflared Tunnel Monitor Service for homepage
+After=network.target network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=zhukunren
+Group=zhukunren
+WorkingDirectory=/home/zhukunren/桌面/项目/内网穿透/app
+
+# 设置环境变量
+Environment="PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"
+Environment="HOME=/home/zhukunren"
+
+# 执行命令
+ExecStart=/usr/bin/python3 /home/zhukunren/桌面/项目/内网穿透/app/tunnel_monitor.py homepage
+
+# 重启策略
+Restart=always
+RestartSec=30
+StartLimitInterval=600
+StartLimitBurst=5
+
+# 日志配置
+StandardOutput=append:/home/zhukunren/桌面/项目/内网穿透/logs/tunnel_service.log
+StandardError=append:/home/zhukunren/桌面/项目/内网穿透/logs/tunnel_service.error.log
+
+# 资源限制
+# 增加文件描述符限制
+LimitNOFILE=65536
+# 增加进程数限制
+LimitNPROC=4096
+
+# 安全选项
+PrivateTmp=yes
+NoNewPrivileges=true
+
+[Install]
+WantedBy=multi-user.target

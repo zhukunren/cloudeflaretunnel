@@ -1,65 +1,144 @@
-Cloudflare 内网穿透 GUI (cloudflared)
+# Cloudflare 内网穿透管理系统
 
-简介
-- 一个基于 Python Tkinter 的轻量 GUI，用于通过 Cloudflare Tunnel(cloudflared) 管理内网穿透：登录、查看/创建/删除隧道、编辑配置、启动/停止隧道、DNS 路由。
+## 项目简介
+基于 Cloudflare Tunnel 的内网穿透管理系统，提供现代化图形界面、自动监控和故障恢复功能。
 
-环境要求
-- Windows 10/11（其它平台理论可用）
-- 安装 Python 3.9+（自带 Tkinter）
-- 安装 cloudflared 并加入 PATH
-  - 不想手动下载？在 GUI 顶部点击“下载”，自动获取并保存 cloudflared 可执行文件。
+## 功能特性
+- 🎨 现代化图形界面管理
+- 🔄 自动重连机制（监控服务）
+- 📊 实时状态监控
+- 🚀 开机自启动（Systemd）
+- 📝 详细日志记录
+- 🌐 DNS 路由管理
+- 🔧 隧道诊断工具
 
-安装 cloudflared
-1) 到 https://developers.cloudflare.com/cloudflare-one/connections/connect-networks/downloads/ 下载对应平台的 cloudflared
-2) 将可执行文件放到某个目录，并把该目录加入 PATH；或在 GUI 里手动选择 cloudflared 路径
+## 环境要求
+- Linux/Unix 系统（推荐 Ubuntu 20.04+）
+- Python 3.8+（包含 Tkinter）
+- Cloudflared CLI 工具
+- Systemd（用于服务管理）
 
-快速开始
-1) 首次授权：运行登录
-   - 打开 GUI 后，点击“登录”，在浏览器完成 Cloudflare 账户授权（绑定你要使用的域名/账户）。
-2) 运行应用
-   - 在项目目录执行：
-     - `python -m app.main`
-3) 隧道管理
-   - 刷新：列出当前账户下的隧道
-   - 下载：自动下载 cloudflared（Windows/架构自动匹配）
-   - 新建隧道：输入名称后创建
-   - 编辑配置：为选中隧道生成/打开 `tunnels/<name>/config.yml`，可配置 ingress 映射
-   - 启动/停止：基于该配置启动或停止隧道进程
-   - DNS 路由：一键为选中隧道绑定域名（创建 Cloudflare DNS 记录）
-   - 删除选中：删除远端隧道（不可恢复）
+## 安装 cloudflared
+1) 访问 https://developers.cloudflare.com/cloudflare-one/connections/connect-networks/downloads/ 下载对应平台版本
+2) 将可执行文件放到 PATH 中，或在 GUI 中手动指定路径
 
-配置说明
-- 生成的配置文件示例：
+## 快速开始
 
-  ```yaml
-  tunnel: <隧道ID>
-  credentials-file: C:/Users/<User>/.cloudflared/<隧道ID>.json
-  ingress:
-    - hostname: app.example.com
-      service: http://localhost:8080
-    - service: http_status:404
-  ```
+### 1. 启动 GUI 管理界面
+```bash
+cd app
+python3 main.py
+# 或
+python3 app/main.py
+```
 
-- credentials-file：由 cloudflared create/login 生成在系统默认目录（Windows: `%USERPROFILE%\.cloudflared`）。
-- ingress：
-  - 若需将本机 8080 暴露为 `app.example.com`，设置如上并在 GUI 里点击“启动”。
-  - 还需执行 DNS 路由（可在 GUI 点击“DNS 路由”，或命令行手动执行）：
-    - `cloudflared tunnel route dns <隧道名> <hostname>`
+### 2. 安装自动监控服务（推荐）
+```bash
+# 需要 root 权限
+sudo scripts/systemd/setup_service.sh install
+```
 
-常见流程
-1) `登录` → `新建隧道` → `编辑配置` 填写 hostname 和本地服务 → 在 DNS 托管于 Cloudflare 的域名下添加路由（GUI 的“DNS 路由”）→ `启动`。
+### 3. 检查服务状态
+```bash
+scripts/utils/check_status.sh
+```
 
-故障排查
-- 登录/创建隧道报错：确保浏览器完成授权，账户下已绑定域。
-- 启动失败：打开日志面板查看输出信息；检查 `credentials-file` 路径是否存在。
-- 无法访问域名：确认在 Cloudflare 面板中域名 DNS 记录已由 `cloudflared tunnel route dns` 创建且为代理状态。
+## 目录结构
+```
+.
+├── app/                      # 应用程序核心代码
+│   ├── cloudflared_cli.py   # Cloudflared CLI 封装
+│   ├── diagnose.py          # 诊断工具
+│   ├── modern_gui.py        # 现代化 GUI 界面
+│   ├── tunnel_monitor.py    # 隧道监控服务
+│   └── main.py              # 主程序入口
+├── scripts/                  # 脚本工具
+│   ├── systemd/             # Systemd 服务相关
+│   │   ├── cloudflared-monitor.service  # 监控服务配置
+│   │   └── setup_service.sh            # 服务安装脚本
+│   └── utils/               # 工具脚本
+│       └── check_status.sh  # 状态检查脚本
+├── tunnels/                 # 隧道配置目录
+│   └── [tunnel_name]/       # 各隧道配置文件夹
+├── config/                  # 配置文件
+└── logs/                    # 日志目录
+    ├── tunnel_*.log         # 隧道日志
+    ├── tunnel_monitor.log   # 监控服务日志
+    └── persistent/          # 持久化日志
 
-开发说明
-- 入口：`app/main.py`
-- GUI：`app/gui.py`
-- cloudflared 封装：`app/cloudflared_cli.py`
+## GUI 使用说明
+- 刷新：列出当前账户下的隧道
+- 下载：自动下载 cloudflared（Windows/架构自动匹配）
+- 新建隧道：输入名称后创建
+- 编辑配置：为选中隧道生成/打开 `tunnels/<name>/config.yml`
+- 启动/停止：基于该配置启动或停止隧道进程
+- DNS 路由：一键为选中隧道绑定域名（创建 Cloudflare DNS 记录）
+- 删除选中：删除远端隧道（不可恢复）
 
-命令速查
+## 监控服务管理
+
+### 服务安装与配置
+```bash
+# 安装服务（需要 root）
+sudo scripts/systemd/setup_service.sh install
+
+# 卸载服务
+sudo scripts/systemd/setup_service.sh uninstall
+
+# 重启服务
+sudo scripts/systemd/setup_service.sh restart
+```
+
+### 服务管理命令
+```bash
+# 查看状态
+sudo systemctl status cloudflared-monitor
+
+# 启动服务
+sudo systemctl start cloudflared-monitor
+
+# 停止服务
+sudo systemctl stop cloudflared-monitor
+
+# 重启服务
+sudo systemctl restart cloudflared-monitor
+
+# 查看服务日志
+journalctl -u cloudflared-monitor -f
+```
+
+### 监控特性
+- **自动重连**: 隧道断开后自动重新连接
+- **健康检查**: 每60秒检查隧道状态
+- **开机自启**: 系统重启后自动启动
+- **故障恢复**: 最多重试3次，避免无限循环
+
+## 故障排查
+
+### 查看日志
+```bash
+# 监控服务日志
+tail -f logs/tunnel_monitor.log
+
+# 隧道持久化日志
+tail -f logs/persistent/[tunnel_name].log
+
+# 应用日志
+tail -f logs/tunnel_*.log
+```
+
+### 运行诊断
+```bash
+python3 app/diagnose.py [tunnel_name]
+```
+
+## 开发说明
+- 入口程序：`app/main.py`
+- GUI 界面：`app/modern_gui.py`
+- 监控服务：`app/tunnel_monitor.py`
+- CLI 封装：`app/cloudflared_cli.py`
+
+## 命令速查
 - 登录：`cloudflared login`
 - 列表：`cloudflared tunnel list --output json`
 - 创建：`cloudflared tunnel create <name>`
