@@ -19,13 +19,67 @@ CHECK_INTERVAL = 60  # 检查间隔（秒）
 RESTART_DELAY = 5  # 重启延迟（秒）
 MAX_RESTART_ATTEMPTS = 3  # 最大重启尝试次数
 LOG_FILE = Path(__file__).parent.parent / "logs" / "tunnel_monitor.log"
+PROJECT_ROOT = Path(__file__).parent.parent
 
 # 确保日志目录存在
 LOG_FILE.parent.mkdir(parents=True, exist_ok=True)
+LOCK_FILE = Path(__file__).parent.parent / "logs" / "pids" / "tunnel_supervisor.lock"
 
 # 全局变量
 running = True
 cloudflared_process = None
+
+
+def get_cloudflared_path() -> str:
+    """获取 cloudflared 可执行文件路径"""
+    # 首先尝试从配置文件读取
+    config_file = PROJECT_ROOT / "config" / "tunnels.json"
+    if config_file.exists():
+        try:
+            data = json.loads(config_file.read_text(encoding="utf-8"))
+            path = data.get("cloudflared_path")
+            if path and Path(path).exists():
+                return path
+        except Exception:
+            pass
+
+    # 然后尝试项目根目录
+    local_path = PROJECT_ROOT / "cloudflared"
+    if local_path.exists():
+        return str(local_path)
+
+    # 最后使用系统 PATH 中的 cloudflared
+    return "cloudflared"
+
+
+
+def _is_pid_running(pid: int) -> bool:
+    if not pid or pid <= 0:
+        return False
+    try:
+        os.kill(pid, 0)
+    except ProcessLookupError:
+        return False
+    except PermissionError:
+        return True
+    except OSError:
+        return False
+    return True
+
+
+def supervisor_active() -> bool:
+    if not LOCK_FILE.exists():
+        return False
+    try:
+        data = json.loads(LOCK_FILE.read_text(encoding="utf-8"))
+    except Exception:
+        return False
+    pid = int(data.get("pid", 0) or 0)
+    if _is_pid_running(pid):
+        owner = data.get("owner", "tunnel_supervisor")
+        log("ERROR", f"检测到隧道守护进程 {owner} (PID {pid}) 正在运行，本监控脚本将退出以避免冲突。")
+        return True
+    return False
 
 def log(level: str, message: str):
     """写入日志"""
@@ -52,28 +106,45 @@ def get_tunnel_config_path(tunnel_name: str) -> Path:
     return config_path
 
 def check_tunnel_status(tunnel_name: str) -> bool:
-    """检查隧道连接状态"""
+    """检查隧道连接状态，使用 JSON 输出精确统计连接数"""
+    cloudflared = get_cloudflared_path()
     try:
-        # 使用 cloudflared tunnel info 检查状态
+        # 使用 cloudflared tunnel info --output json 检查状态
         result = subprocess.run(
-            ["cloudflared", "tunnel", "info", tunnel_name],
+            [cloudflared, "tunnel", "info", "--output", "json", tunnel_name],
             capture_output=True,
             text=True,
-            timeout=10
+            timeout=15
         )
 
         if result.returncode == 0:
-            # 检查是否有活跃连接
-            output = result.stdout
-            # 检查输出中是否包含 CONNECTOR ID（表示有连接器在运行）
-            if "CONNECTOR ID" in output and "EDGE" in output:
-                # 进一步检查连接是否真的在工作
-                return check_tunnel_connectivity(tunnel_name)
-            else:
-                log("WARNING", f"隧道 {tunnel_name} 没有活跃的连接器")
-                return False
+            try:
+                data = json.loads(result.stdout)
+                # 统计活跃连接数
+                total_conns = 0
+                if isinstance(data, dict):
+                    for connector in data.get("conns", []):
+                        if isinstance(connector, dict):
+                            inner_conns = connector.get("conns", [])
+                            total_conns += len(inner_conns)
+
+                if total_conns > 0:
+                    log("DEBUG", f"隧道 {tunnel_name} 有 {total_conns} 条活跃连接")
+                    return True
+                else:
+                    log("WARNING", f"隧道 {tunnel_name} 没有活跃连接")
+                    return False
+            except json.JSONDecodeError:
+                # JSON 解析失败，回退到文本解析
+                output = result.stdout
+                if "CONNECTOR ID" in output and "EDGE" in output:
+                    log("DEBUG", f"隧道 {tunnel_name} 检测到连接器（文本模式）")
+                    return True
+                else:
+                    log("WARNING", f"隧道 {tunnel_name} 没有活跃的连接器")
+                    return False
         else:
-            log("ERROR", f"无法获取隧道 {tunnel_name} 信息")
+            log("ERROR", f"无法获取隧道 {tunnel_name} 信息: {result.stderr}")
             return False
 
     except subprocess.TimeoutExpired:
@@ -84,11 +155,10 @@ def check_tunnel_status(tunnel_name: str) -> bool:
         return False
 
 def check_tunnel_connectivity(tunnel_name: str) -> bool:
-    """检查隧道连通性"""
+    """检查隧道连通性（检查进程是否存在）"""
     try:
-        # 检查 cloudflared 进程是否在运行
         result = subprocess.run(
-            ["pgrep", "-f", f"tunnel run {tunnel_name}"],
+            ["pgrep", "-f", f"tunnel.*run.*{tunnel_name}"],
             capture_output=True,
             timeout=5
         )
@@ -123,8 +193,9 @@ def start_tunnel(tunnel_name: str) -> subprocess.Popen:
         log("INFO", f"正在启动隧道 {tunnel_name}...")
 
         # 构建启动命令
+        cloudflared = get_cloudflared_path()
         cmd = [
-            "cloudflared",
+            cloudflared,
             "--config", str(config_path),
             "tunnel", "run", tunnel_name
         ]
@@ -266,6 +337,9 @@ def main():
     log("INFO", "Cloudflared 隧道监控服务启动")
     log("INFO", f"监控隧道: {tunnel_name}")
     log("INFO", "="*50)
+
+    if supervisor_active():
+        return
 
     try:
         monitor_tunnel(tunnel_name)
