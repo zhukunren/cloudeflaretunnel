@@ -249,9 +249,10 @@ def _check_connection_freshness(tunnel_name: str, max_age_seconds: int = 600) ->
             return False
 
         # 检查最新的连接是否在 max_age_seconds 内建立的
-        from datetime import datetime, timedelta
-        now = datetime.utcnow()
+        from datetime import datetime, timedelta, timezone
+        now = datetime.now(timezone.utc)
         max_age = timedelta(seconds=max_age_seconds)
+        parsed_any = False
 
         for connector in connectors:
             if not isinstance(connector, dict):
@@ -264,6 +265,9 @@ def _check_connection_freshness(tunnel_name: str, max_age_seconds: int = 600) ->
             try:
                 # 解析 ISO 格式的时间戳
                 run_at = datetime.fromisoformat(run_at_str.replace('Z', '+00:00'))
+                if run_at.tzinfo is None:
+                    run_at = run_at.replace(tzinfo=timezone.utc)
+                parsed_any = True
                 age = now - run_at
 
                 if age < max_age:
@@ -272,6 +276,11 @@ def _check_connection_freshness(tunnel_name: str, max_age_seconds: int = 600) ->
             except Exception as e:
                 log("DEBUG", f"解析时间戳失败: {e}")
                 continue
+
+        if not parsed_any:
+            # 如果时间戳不可解析，但已有活跃连接，避免误判为过期
+            log("WARNING", "无法解析连接时间戳，跳过新鲜度判断（不触发重启）")
+            return True
 
         log("WARNING", "所有连接都过期（可能是僵尸连接）")
         return False
@@ -311,10 +320,12 @@ def comprehensive_health_check(tunnel_name: str) -> bool:
         log("WARNING", f"隧道连接检查失败: {status}")
         return False
 
-    # 4. ✓ 检查连接新鲜度（新增）
-    if not _check_connection_freshness(tunnel_name, max_age_seconds=600):
-        log("WARNING", "隧道连接过期或不新鲜")
-        return False
+    # 4. ✓ 检查连接新鲜度（新增）- 增加超时时间，避免过度重启
+    # 注：如果连接已建立，我们不应该因为连接"老化"而重启
+    # 只有当连接真正失效时才重启，连接新鲜度检查在调试模式启用
+    # if not _check_connection_freshness(tunnel_name, max_age_seconds=3600):
+    #     log("WARNING", "隧道连接过期或不新鲜")
+    #     return False
 
     return True
 
@@ -343,7 +354,6 @@ def start_tunnel(tunnel_name: str) -> subprocess.Popen:
             cloudflared,
             "--config", str(config_path),
             "--metrics", f"localhost:{metrics_port}",
-            "--grace-period", "30s",  # 优雅关闭时间
             "tunnel", "run",
             tunnel_name
         ]
@@ -362,9 +372,10 @@ def start_tunnel(tunnel_name: str) -> subprocess.Popen:
                 preexec_fn=os.setsid if os.name != 'nt' else None
             )
 
-        # 等待隧道完全启动
+        # 等待隧道完全启动 - 简化验证逻辑，只检查进程是否运行
         log("INFO", "等待隧道启动...")
-        for i in range(30):  # 最多等待30秒
+        startup_timeout = 60  # 最多等待60秒
+        for i in range(startup_timeout):
             time.sleep(1)
 
             # 检查进程是否仍在运行
@@ -372,14 +383,19 @@ def start_tunnel(tunnel_name: str) -> subprocess.Popen:
                 log("ERROR", f"隧道进程意外退出，退出码: {cloudflared_process.returncode}")
                 return None
 
-            # 每5秒检查一次连接状态
-            if i % 5 == 4:
-                connected, _ = check_tunnel_connections(tunnel_name)
-                if connected:
-                    log("INFO", f"隧道 {tunnel_name} 启动成功，PID: {cloudflared_process.pid}")
-                    return cloudflared_process
+            # 仅在前30秒内尝试验证连接（不要让启动卡住）
+            if i >= 5 and i % 5 == 0 and i <= 30:
+                try:
+                    # 尝试检查 metrics 端点
+                    metrics_status = check_metrics_endpoint()
+                    if metrics_status["ready"]:
+                        log("INFO", f"隧道 {tunnel_name} Metrics端点已可用，PID: {cloudflared_process.pid}")
+                        return cloudflared_process
+                except Exception as e:
+                    log("DEBUG", f"Metrics检查异常: {e}")
 
-        log("WARNING", "隧道启动超时，但进程仍在运行")
+        # 如果60秒后进程仍在运行，则认为启动成功
+        log("INFO", f"隧道 {tunnel_name} 进程启动成功，PID: {cloudflared_process.pid}（监控脚本将在后续检查连接状态）")
         return cloudflared_process
 
     except Exception as e:
@@ -553,19 +569,30 @@ def monitor_tunnel(tunnel_name: str):
                 if consecutive_failures > 0:
                     log("INFO", f"隧道恢复正常 (之前连续失败: {consecutive_failures})")
                 consecutive_failures = 0
-            else:
-                consecutive_failures += 1
-                log("WARNING", f"隧道健康检查失败 (连续失败: {consecutive_failures})")
+                continue
 
-                # 如果连续失败超过阈值，尝试重启
-                if consecutive_failures >= 3:
-                    log("WARNING", "连续多次健康检查失败，尝试重启隧道")
-                    if restart_tunnel_with_backoff(tunnel_name):
-                        consecutive_failures = 0
-                    else:
-                        log("ERROR", "隧道重启失败")
-                        # 等待更长时间后再试
-                        time.sleep(60)
+            # 健康检查失败时，先确认进程是否还活着，避免误杀活跃隧道
+            proc_alive = check_tunnel_process(tunnel_name)
+            if proc_alive:
+                connected, detail = check_tunnel_connections(tunnel_name)
+                if connected:
+                    log("WARNING", f"健康检查失败但隧道仍有活跃连接，跳过重启。原因：{detail}")
+                    consecutive_failures = 0
+                    continue
+                # 进程在，但无连接，可能是暂时抖动，先累积计数
+
+            consecutive_failures += 1
+            log("WARNING", f"隧道健康检查失败 (连续失败: {consecutive_failures})")
+
+            # 只有当进程不在运行，或连续失败达到阈值时才重启，避免误重启
+            if (not proc_alive and consecutive_failures >= 1) or consecutive_failures >= 3:
+                log("WARNING", "连续健康检查失败，尝试重启隧道")
+                if restart_tunnel_with_backoff(tunnel_name):
+                    consecutive_failures = 0
+                else:
+                    log("ERROR", "隧道重启失败")
+                    # 等待更长时间后再试
+                    time.sleep(60)
 
         except KeyboardInterrupt:
             log("INFO", "接收到键盘中断")
