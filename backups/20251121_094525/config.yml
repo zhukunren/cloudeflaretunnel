@@ -1,0 +1,8 @@
+tunnel: 63fee2b7-d431-4037-a453-5598013d9c49
+credentials-file: /home/zhukunren/.cloudflared/63fee2b7-d431-4037-a453-5598013d9c49.json
+ingress:
+  - hostname: dwzq.top
+    service: http://localhost:8080
+  - hostname: www.dwzq.top
+    service: http://localhost:8080
+  - service: http_status:404

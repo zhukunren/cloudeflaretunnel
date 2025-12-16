@@ -1,0 +1,26 @@
+tunnel: 6923411d-d932-4ca5-8f35-ee643f8a5bc5
+credentials-file: /home/zhukunren/.cloudflared/6923411d-d932-4ca5-8f35-ee643f8a5bc5.json
+
+resolver: 1.1.1.1
+fallback-resolver: 1.0.0.1
+ha-connections: 4
+loglevel: info
+logfile: /home/zhukunren/桌面/项目/内网穿透/logs/persistent/cloudflared_agenttrading.log
+protocol: http2
+
+originRequest:
+  connectTimeout: 30s
+  tcpKeepAlive: 30s
+  keepAliveConnections: 1
+  keepAliveTimeout: 90s
+  http2Origin: true
+
+ingress:
+  - hostname: agent.dwzq.top
+    service: http://localhost:3000
+    originRequest:
+      connectTimeout: 10s
+      tcpKeepAlive: 10s
+      http2Origin: true
+  - service: http_status:404
+

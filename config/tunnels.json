@@ -1,0 +1,27 @@
+{
+  "cloudflared_path": "/home/zhukunren/桌面/项目/内网穿透/cloudflared",
+  "auto_restart": true,
+  "tunnels": [
+    {
+      "name": "homepage",
+      "config": "tunnels/homepage/config.yml",
+      "auto_start": true,
+      "health_check": true,
+      "tags": ["core", "public"]
+    },
+    {
+      "name": "agenttrading",
+      "config": "tunnels/agenttrading/config.yml",
+      "auto_start": true,
+      "health_check": true,
+      "tags": ["trading"]
+    },
+    {
+      "name": "kline",
+      "config": "tunnels/kline/config.yml",
+      "auto_start": true,
+      "health_check": true,
+      "tags": ["trading"]
+    }
+  ]
+}

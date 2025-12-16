@@ -1,5 +1,6 @@
 from __future__ import annotations
 import json
+import re
 import os
 import shlex
 import subprocess
@@ -107,29 +108,110 @@ def login(cloudflared_path: str) -> subprocess.Popen:
     return subprocess.Popen([binary, "login"], creationflags=creationflags)
 
 
-def list_tunnels(cloudflared_path: str) -> list[dict]:
+def list_tunnels(cloudflared_path: str, return_error: bool = False) -> list[dict] | tuple[list[dict], str | None]:
+    """
+    列出 Cloudflare 隧道。
+
+    return_error=True 时返回 (列表, 错误消息) 便于上层友好提示。
+    """
     binary = _ensure_binary(cloudflared_path)
+    error_msg = None
     try:
-        out = subprocess.check_output([binary, "tunnel", "list", "--output", "json"],
-                                       text=True, encoding="utf-8")
+        out = subprocess.check_output(
+            [binary, "tunnel", "list", "--output", "json"],
+            text=True,
+            encoding="utf-8",
+            stderr=subprocess.PIPE,
+        )
         data = json.loads(out)
-        return data if isinstance(data, list) else []
-    except Exception:
+        result = data if isinstance(data, list) else []
+        return (result, None) if return_error else result
+    except Exception as exc:
+        if isinstance(exc, subprocess.CalledProcessError):
+            error_msg = (exc.stderr or exc.output or "").strip() or str(exc)
+        else:
+            error_msg = str(exc)
+
         try:
-            out = subprocess.check_output([binary, "tunnel", "list"],
-                                          text=True, encoding="utf-8")
+            out = subprocess.check_output(
+                [binary, "tunnel", "list"],
+                text=True,
+                encoding="utf-8",
+                stderr=subprocess.PIPE,
+            )
             lines = [l for l in out.splitlines() if l.strip()]
             if not lines:
-                return []
-            header = [h.strip().lower() for h in lines[0].split("\t")]
-            items = []
-            for line in lines[1:]:
-                cols = [c.strip() for c in line.split("\t")]
-                item = {header[i] if i < len(header) else f"col{i}": cols[i] for i in range(min(len(cols), len(header)))}
-                items.append(item)
-            return items
+                result = []
+            else:
+                header = [h.strip().lower() for h in lines[0].split("\t")]
+                items = []
+                for line in lines[1:]:
+                    cols = [c.strip() for c in line.split("\t")]
+                    item = {
+                        header[i] if i < len(header) else f"col{i}": cols[i]
+                        for i in range(min(len(cols), len(header)))
+                    }
+                    items.append(item)
+                result = items
+        except Exception as exc2:
+            if isinstance(exc2, subprocess.CalledProcessError):
+                error_msg = error_msg or (exc2.stderr or exc2.output or "").strip() or str(exc2)
+            else:
+                error_msg = error_msg or str(exc2)
+            result = []
+
+        return (result, error_msg) if return_error else result
+
+
+def load_local_tunnels(base_dir: str | os.PathLike[str] | None = None) -> list[dict]:
+    """从本地配置加载隧道列表，用于离线模式。"""
+    root = Path(base_dir) if base_dir else Path(__file__).resolve().parent.parent
+    tunnels: list[dict] = []
+    seen: set[str] = set()
+
+    config_json = root / "config" / "tunnels.json"
+    if config_json.exists():
+        try:
+            data = json.loads(config_json.read_text(encoding="utf-8"))
+            for item in data.get("tunnels", []):
+                name = item.get("name")
+                if not name or name in seen:
+                    continue
+                cfg_raw = item.get("config") or f"tunnels/{name}/config.yml"
+                cfg_path = Path(cfg_raw)
+                if not cfg_path.is_absolute():
+                    cfg_path = root / cfg_path
+                tid = extract_tunnel_id_from_config(cfg_path) or ""
+                tunnels.append(
+                    {
+                        "name": name,
+                        "id": tid,
+                        "config": str(cfg_path),
+                        "source": "local-config",
+                    }
+                )
+                seen.add(name)
         except Exception:
-            return []
+            pass
+
+    tunnels_dir = root / "tunnels"
+    if tunnels_dir.exists():
+        for cfg in tunnels_dir.glob("*/config.yml"):
+            name = cfg.parent.name
+            if name in seen:
+                continue
+            tid = extract_tunnel_id_from_config(cfg) or ""
+            tunnels.append(
+                {
+                    "name": name,
+                    "id": tid,
+                    "config": str(cfg),
+                    "source": "local-scan",
+                }
+            )
+            seen.add(name)
+
+    return tunnels
 
 
 def create_tunnel(cloudflared_path: str, name: str, origin_cert: str | os.PathLike[str] | None = None) -> tuple[bool, str]:
@@ -562,10 +644,29 @@ def _create_popen(cmd: list[str], workdir: Path | None = None, capture_output: b
     return proc
 
 
+def get_config_protocol(config_path: Path) -> str | None:
+    """读取配置文件中的协议设置（例如 http2/quic），未设置时返回 None。"""
+    if not config_path.exists():
+        return None
+    try:
+        import yaml
+        data = yaml.safe_load(config_path.read_text(encoding="utf-8")) or {}
+        protocol = data.get("protocol")
+        if isinstance(protocol, str) and protocol.strip():
+            return protocol.strip()
+    except Exception:
+        return None
+    return None
+
+
 def run_tunnel(cloudflared_path: str, name: str, config_path: Path,
-               capture_output: bool = True, log_file: Path | None = None) -> subprocess.Popen:
+               capture_output: bool = True, log_file: Path | None = None,
+               protocol: str | None = None) -> subprocess.Popen:
     binary = _ensure_binary(cloudflared_path)
-    cmd = [binary, "--config", str(config_path), "tunnel", "run", name]
+    cmd = [binary, "--config", str(config_path)]
+    if protocol:
+        cmd.extend(["--protocol", protocol])
+    cmd.extend(["tunnel", "run", name])
     return _create_popen(cmd, workdir=config_path.parent, capture_output=capture_output, log_file=log_file)
 
 
@@ -802,37 +903,116 @@ def kill_tunnel_by_name(tunnel_name: str) -> tuple[bool, str]:
         return False, f"停止隧道失败: {e}"
 
 
-def test_connection(cloudflared_path: str, tunnel_name: str, timeout: int = 10) -> tuple[bool, str]:
+def test_connection(cloudflared_path: str, tunnel_name: str, timeout: int = 10) -> tuple[bool | None, str]:
     """测试隧道连接是否正常"""
     try:
         binary = _ensure_binary(cloudflared_path)
     except CloudflaredBinaryError as e:
         return False, str(e)
+
+    json_output: str | None = None
     text_output: str | None = None
 
+    def _looks_like_edge(obj: object) -> bool:
+        return isinstance(obj, dict) and ("colo_name" in obj or "origin_ip" in obj or "opened_at" in obj)
+
+    def _collect_connectors(payload: dict) -> list[dict]:
+        """兼容不同 cloudflared 版本的连接器字段"""
+        connectors: list[dict] = []
+
+        def _pick(source: list[object] | None):
+            if not isinstance(source, list):
+                return
+            for item in source:
+                if isinstance(item, dict) and not _looks_like_edge(item):
+                    connectors.append(item)
+
+        for key in ("conns", "connectors", "connections"):
+            _pick(payload.get(key))
+
+        tunnel_block = payload.get("tunnel")
+        if isinstance(tunnel_block, dict):
+            for key in ("conns", "connectors", "connections"):
+                _pick(tunnel_block.get(key))
+
+        return connectors
+
+    def _collect_edges(connector: dict) -> list[dict]:
+        edges: list[dict] = []
+        for key in ("conns", "connections", "edges"):
+            candidates = connector.get(key)
+            if isinstance(candidates, list):
+                edges.extend([e for e in candidates if isinstance(e, dict)])
+        return edges
+
     def _format_json_summary(data: dict) -> tuple[int, str]:
-        connectors = data.get("conns") or []
+        connectors = _collect_connectors(data)
         lines: list[str] = []
         total = 0
         for connector in connectors:
-            if not isinstance(connector, dict):
-                continue
             cid = connector.get("id", "未知ID")
             version = connector.get("version", "")
             arch = connector.get("arch", "")
-            run_at = connector.get("run_at", "")
+            run_at = connector.get("run_at", connector.get("created_at", ""))
+            edges = _collect_edges(connector)
+            # 某些版本只返回计数字段
+            if not edges and isinstance(connector.get("num_connections"), int):
+                total += int(connector.get("num_connections", 0))
+            else:
+                total += len(edges)
+
             lines.append(f"- 连接器 {cid} ({version} {arch}) 启动于 {run_at}")
-            for edge in connector.get("conns") or []:
-                if not isinstance(edge, dict):
-                    continue
-                total += 1
+            for edge in edges:
                 colo = edge.get("colo_name", "?")
                 origin_ip = edge.get("origin_ip", "?")
-                opened = edge.get("opened_at", "")
+                opened = edge.get("opened_at", edge.get("started_at", ""))
                 edge_id = edge.get("id", "")
                 lines.append(f"    · 节点 {colo} ({origin_ip}) - {edge_id} @ {opened}")
         summary = "\n".join(lines) if lines else ""
         return total, summary
+
+    def _parse_text_edges(text: str) -> int:
+        """从 text 模式的输出中解析边缘连接数，避免 JSON 结构变化导致误报"""
+        total = 0
+        in_table = False
+        for raw in text.splitlines():
+            line = raw.strip()
+            if not line:
+                continue
+            if line.startswith("CONNECTOR ID"):
+                in_table = True
+                continue
+            if not in_table:
+                continue
+            parts = line.split()
+            if len(parts) < 6:
+                continue
+            edge_field = " ".join(parts[5:])
+            for match in re.finditer(r"(\d+)x", edge_field):
+                total += int(match.group(1))
+        return total
+
+    def _classify_failure(detail_text: str) -> tuple[bool | None, str]:
+        """区分 API/网络异常与真实无连接，避免误杀"""
+        detail = detail_text or ""
+        lower = detail.lower()
+        api_keywords = ("rest request failed", "api call", "status 5", "internal server error", "service unavailable")
+        network_keywords = (
+            "timeout",
+            "timed out",
+            "context deadline exceeded",
+            "tls handshake",
+            "failed to dial to edge",
+            "no recent network activity",
+            "no free edge addresses",
+        )
+        if any(k in lower for k in api_keywords):
+            return None, f"Cloudflare API 返回错误，跳过自动重启判定：\n{detail}"
+        if any(k in lower for k in network_keywords):
+            return None, f"到 Cloudflare 边缘的连接异常（可能网络抖动/被阻断），跳过自动重启判定：\n{detail}"
+        if "no active connector" in lower or "no active connection" in lower:
+            return False, detail or "隧道没有活跃连接"
+        return False, detail or "隧道信息不完整"
 
     try:
         json_output = subprocess.check_output(
@@ -855,15 +1035,26 @@ def test_connection(cloudflared_path: str, tunnel_name: str, timeout: int = 10) 
         except Exception:
             text_output = None
 
+        # JSON 结构发生变化时，回退到文本解析以避免误报无连接
+        if active == 0 and text_output:
+            parsed_edges = _parse_text_edges(text_output)
+            if parsed_edges > 0:
+                active = parsed_edges
+                if not summary:
+                    summary = text_output
+
         detail = summary or (text_output or json_output)
         name = data.get("name", tunnel_name) if isinstance(data, dict) else tunnel_name
         if active > 0:
             return True, f"隧道 {name} 有 {active} 条活跃连接\n{detail}"
-        return False, f"隧道 {name} 没有任何活跃连接\n请确认 cloudflared 进程正在运行。\n{detail}"
+        classified_ok, classified_detail = _classify_failure(detail)
+        if classified_ok is None:
+            return None, classified_detail
+        return False, f"隧道 {name} 没有任何活跃连接\n请确认 cloudflared 进程正在运行。\n{classified_detail}"
     except subprocess.CalledProcessError as e:
         text_output = e.output or text_output
     except subprocess.TimeoutExpired:
-        return False, "测试超时，请检查网络连接"
+        return None, "测试超时（可能网络抖动），跳过自动重启判定"
     except (json.JSONDecodeError, ValueError):
         pass
 
@@ -876,16 +1067,24 @@ def test_connection(cloudflared_path: str, tunnel_name: str, timeout: int = 10) 
                 encoding="utf-8",
                 timeout=timeout,
             )
+        classified_ok, classified_detail = _classify_failure(text_output)
+        if classified_ok is None:
+            return None, classified_detail
         lower = text_output.lower()
         if "no active connector" in lower or "no active connection" in lower:
-            return False, f"隧道没有任何活动连接\n{text_output}"
+            return False, f"隧道没有任何活动连接\n{classified_detail}"
+        parsed_edges = _parse_text_edges(text_output)
+        if parsed_edges > 0:
+            return True, f"隧道 {tunnel_name} 有 {parsed_edges} 条活跃连接\n{text_output}"
         if tunnel_name.lower() in lower or "connection" in lower:
             return True, f"隧道 {tunnel_name} 信息获取成功\n{text_output}"
-        return False, f"隧道信息不完整\n{text_output}"
+        if classified_ok is None:
+            return None, classified_detail
+        return False, f"隧道信息不完整\n{classified_detail}"
     except subprocess.TimeoutExpired:
-        return False, "测试超时，请检查网络连接"
+        return None, "测试超时（可能网络抖动），跳过自动重启判定"
     except subprocess.CalledProcessError as e:
-        return False, f"测试失败: {e.output}"
+        return None, f"测试失败（cloudflared 返回非零，视为未知）：{e.output}"
     except Exception as e:
         return False, f"测试出错: {str(e)}"
 

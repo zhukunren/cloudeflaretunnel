@@ -50,20 +50,22 @@ scripts/utils/check_status.sh
 │   ├── cloudflared_cli.py   # Cloudflared CLI 封装
 │   ├── diagnose.py          # 诊断工具
 │   ├── modern_gui.py        # 现代化 GUI 界面
-│   ├── tunnel_monitor.py    # 隧道监控服务
+│   ├── tunnel_monitor.py    # 旧版监控脚本（兼容保留）
+│   ├── tunnel_supervisor.py # 多隧道守护进程
 │   └── main.py              # 主程序入口
 ├── scripts/                  # 脚本工具
 │   ├── systemd/             # Systemd 服务相关
-│   │   ├── cloudflared-monitor.service  # 监控服务配置
-│   │   └── setup_service.sh            # 服务安装脚本
-│   └── utils/               # 工具脚本
-│       └── check_status.sh  # 状态检查脚本
+│   │   ├── cloudflared-monitor.service   # 旧版监控 Service（已弃用）
+│   │   ├── tunnel-supervisor.service     # 新 Supervisor Service
+│   │   └── setup_service.sh              # 旧版安装脚本
+│   ├── deploy_supervisor.sh   # 一键部署 Supervisor
+│   └── check_tunnel_status.sh # Supervisor 版状态巡检脚本
 ├── tunnels/                 # 隧道配置目录
 │   └── [tunnel_name]/       # 各隧道配置文件夹
 ├── config/                  # 配置文件
 └── logs/                    # 日志目录
     ├── tunnel_*.log         # 隧道日志
-    ├── tunnel_monitor.log   # 监控服务日志
+    ├── tunnel_supervisor.log # Supervisor 日志
     └── persistent/          # 持久化日志
 
 ## GUI 使用说明
@@ -74,51 +76,52 @@ scripts/utils/check_status.sh
 - 启动/停止：基于该配置启动或停止隧道进程
 - DNS 路由：一键为选中隧道绑定域名（创建 Cloudflare DNS 记录）
 - 删除选中：删除远端隧道（不可恢复）
+- 守护进程配合：如果系统已启用 `tunnel_supervisor.service`，GUI 会自动把“启动/停止”请求交给守护进程执行，普通用户无需打开终端即可管理所有隧道。
 
-## 监控服务管理
+## 隧道 Supervisor 管理
 
-### 服务安装与配置
+### 部署 / 更新
 ```bash
-# 安装服务（需要 root）
-sudo scripts/systemd/setup_service.sh install
-
-# 卸载服务
-sudo scripts/systemd/setup_service.sh uninstall
-
-# 重启服务
-sudo scripts/systemd/setup_service.sh restart
+cd /home/zhukunren/桌面/项目/内网穿透
+sudo ./scripts/deploy_supervisor.sh
 ```
 
-### 服务管理命令
+### 手动运行（调试）
+```bash
+python -m app.tunnel_supervisor watch --interval 30
+```
+
+### 常用命令
 ```bash
 # 查看状态
-sudo systemctl status cloudflared-monitor
+sudo systemctl status tunnel-supervisor.service
 
-# 启动服务
-sudo systemctl start cloudflared-monitor
+# 查看日志
+sudo journalctl -u tunnel-supervisor.service -f
 
-# 停止服务
-sudo systemctl stop cloudflared-monitor
+# 批量巡检
+./scripts/check_tunnel_status.sh
+# 仅查看异常
+./scripts/check_tunnel_status.sh --only-issues
+# 指定隧道
+./scripts/check_tunnel_status.sh --tunnel kline
 
-# 重启服务
-sudo systemctl restart cloudflared-monitor
-
-# 查看服务日志
-journalctl -u cloudflared-monitor -f
+# 单条隧道状态
+python -m app.tunnel_supervisor status <name>
 ```
 
-### 监控特性
-- **自动重连**: 隧道断开后自动重新连接
-- **健康检查**: 每60秒检查隧道状态
-- **开机自启**: 系统重启后自动启动
-- **故障恢复**: 最多重试3次，避免无限循环
+### 特性
+- **单点调度**：所有云隧道由 tunnel_supervisor 统一管理
+- **多隧道支持**：基于 `config/tunnels.json` 自动拉起多个隧道
+- **健康检查**：调用 `cloudflared tunnel info` 判断连接数量，异常自动重启
+- **锁/PID 文件**：防止 GUI/脚本与守护进程同时操作
 
 ## 故障排查
 
 ### 查看日志
 ```bash
-# 监控服务日志
-tail -f logs/tunnel_monitor.log
+# Supervisor 日志
+tail -f logs/tunnel_supervisor.log
 
 # 隧道持久化日志
 tail -f logs/persistent/[tunnel_name].log
@@ -135,7 +138,7 @@ python3 app/diagnose.py [tunnel_name]
 ## 开发说明
 - 入口程序：`app/main.py`
 - GUI 界面：`app/modern_gui.py`
-- 监控服务：`app/tunnel_monitor.py`
+- 守护进程：`app/tunnel_supervisor.py`
 - CLI 封装：`app/cloudflared_cli.py`
 
 ## 命令速查

@@ -1,0 +1,26 @@
+[Unit]
+Description=Cloudflared Tunnel Supervisor
+After=network.target network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=zhukunren
+Group=zhukunren
+WorkingDirectory=/home/zhukunren/桌面/项目/内网穿透
+Environment="PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"
+Environment="HOME=/home/zhukunren"
+ExecStart=/usr/bin/python3 -m app.tunnel_supervisor watch --interval 30
+Restart=always
+RestartSec=15
+StartLimitInterval=600
+StartLimitBurst=5
+StandardOutput=append:/home/zhukunren/桌面/项目/内网穿透/logs/tunnel_supervisor.service.log
+StandardError=append:/home/zhukunren/桌面/项目/内网穿透/logs/tunnel_supervisor.service.error.log
+LimitNOFILE=65536
+LimitNPROC=4096
+PrivateTmp=yes
+NoNewPrivileges=true
+
+[Install]
+WantedBy=multi-user.target

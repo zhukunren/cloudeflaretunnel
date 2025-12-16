@@ -1,5 +1,35 @@
 tunnel: 279494ef-35da-48d3-971b-93c40cc6b70e
 credentials-file: /home/zhukunren/.cloudflared/279494ef-35da-48d3-971b-93c40cc6b70e.json
+
+# 强制使用公共 DNS，避免本地 127.0.0.53 受限导致无法解析 api.cloudflare.com
+resolver: 1.1.1.1
+fallback-resolver: 1.0.0.1
+
+# 高可用连接数
+ha-connections: 4
+
+# 日志配置
+loglevel: info
+logfile: /home/zhukunren/桌面/项目/内网穿透/logs/persistent/cloudflared_kline.log
+
+# 传输协议配置（使用HTTP/2获得更好的稳定性）
+protocol: http2
+
+# 重试配置
+retries: 5
+
+# 隧道参数优化
+originRequest:
+  # 连接超时设置
+  connectTimeout: 30s
+  # TCP保活设置
+  tcpKeepAlive: 30s
+  # 保持连接存活时间
+  keepAliveConnections: 1
+  # 保持连接超时
+  keepAliveTimeout: 90s
+
+# 入站规则配置
 ingress:
   - hostname: kline.dwzq.top
     service: http://localhost:5173

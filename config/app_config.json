@@ -1,12 +1,12 @@
 {
   "window": {
-    "width": 1200,
-    "height": 700,
+    "width": 1854,
+    "height": 1009,
     "min_width": 1000,
     "min_height": 600,
     "remember_position": true,
-    "x": 332,
-    "y": 133
+    "x": 66,
+    "y": 32
   },
   "cloudflared": {
     "path": "/home/zhukunren/桌面/项目/内网穿透/cloudflared",
@@ -30,6 +30,7 @@
     "last_selected": "kline",
     "persist_on_exit": true,
     "auto_start_enabled": true,
-    "autostart_tunnel": "kline"
+    "autostart_tunnel": "agenttrading",
+    "auto_heal_enabled": true
   }
 }

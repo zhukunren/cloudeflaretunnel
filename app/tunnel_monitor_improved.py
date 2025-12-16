@@ -128,7 +128,7 @@ def signal_handler(signum, frame):
     global running
     log("INFO", f"接收到信号 {signum}，准备优雅退出...")
     running = False
-    stop_tunnel(current_tunnel_name)
+    # 不再主动停止隧道，避免外部信号误杀正在运行的隧道
     sys.exit(0)
 
 def get_tunnel_config_path(tunnel_name: str) -> Path:
@@ -159,8 +159,10 @@ def check_metrics_endpoint() -> dict:
         log("DEBUG", f"Metrics端点检查异常: {e}")
         return {"ready": False, "status": "error"}
 
-def check_tunnel_connections(tunnel_name: str) -> tuple[bool, str]:
-    """使用cloudflared tunnel info命令检查隧道连接"""
+def check_tunnel_connections(tunnel_name: str) -> tuple[bool | None, str]:
+    """使用cloudflared tunnel info命令检查隧道连接
+
+    返回 (True, msg) 有连接；(False, msg) 确认无连接；(None, msg) 表示 API/网络异常，状态未知。"""
     cloudflared = get_cloudflared_path()
     try:
         # 使用JSON输出格式获取更准确的信息
@@ -175,6 +177,10 @@ def check_tunnel_connections(tunnel_name: str) -> tuple[bool, str]:
             try:
                 data = json.loads(result.stdout)
                 connectors = data.get("conns", [])
+
+                # API 返回错误但 exit code 为 0 的情况
+                if isinstance(data, dict) and data.get("code") in (500, 503):
+                    return None, f"Cloudflare API 返回 {data.get('code')}: {data.get('message', '')}"
 
                 active_connections = 0
                 for connector in connectors:
@@ -197,12 +203,27 @@ def check_tunnel_connections(tunnel_name: str) -> tuple[bool, str]:
                     return False, "No connector found"
         else:
             error_msg = result.stderr or result.stdout
+            lower = (error_msg or "").lower()
+            network_hints = (
+                "tls handshake",
+                "no recent network activity",
+                "failed to dial to edge",
+                "no free edge addresses",
+                "timeout",
+                "timed out",
+                "context deadline exceeded",
+            )
+            api_hints = ("api call", "rest request failed", "status 5", "internal server error", "service unavailable")
+            if any(k in lower for k in api_hints):
+                return None, f"Cloudflare API 错误：{error_msg}"
+            if any(k in lower for k in network_hints):
+                return None, f"到 Cloudflare 边缘的网络异常：{error_msg}"
             return False, f"Command failed: {error_msg}"
 
     except subprocess.TimeoutExpired:
-        return False, "Check timeout"
+        return None, "Check timeout (可能网络抖动)"
     except Exception as e:
-        return False, f"Check error: {e}"
+        return None, f"Check error: {e}"
 
 def check_tunnel_process(tunnel_name: str) -> bool:
     """检查隧道进程是否在运行"""
@@ -316,7 +337,10 @@ def comprehensive_health_check(tunnel_name: str) -> bool:
 
     # 3. 检查实际连接
     connected, status = check_tunnel_connections(tunnel_name)
-    if not connected:
+    if connected is None:
+        log("INFO", f"隧道连接状态未知（跳过判定）：{status}")
+        return True
+    if connected is False:
         log("WARNING", f"隧道连接检查失败: {status}")
         return False
 
@@ -510,6 +534,11 @@ def restart_tunnel_with_backoff(tunnel_name: str, attempt: int = 0) -> bool:
         log("ERROR", f"已达到最大重启次数 ({MAX_RESTART_ATTEMPTS})")
         return False
 
+    # 如果进程仍在运行，避免发送 SIGTERM 误杀，直接跳过
+    if check_tunnel_process(tunnel_name):
+        log("WARNING", "检测到隧道进程仍在运行，跳过自动重启以避免误杀")
+        return False
+
     # 检查重启冷却时间
     current_time = time.time()
     if current_time - last_restart_time < restart_cooldown and attempt == 0:
@@ -521,9 +550,6 @@ def restart_tunnel_with_backoff(tunnel_name: str, attempt: int = 0) -> bool:
     backoff_time = min(backoff_time, 300)  # 最大5分钟
 
     log("INFO", f"正在重启隧道 (尝试 {attempt + 1}/{MAX_RESTART_ATTEMPTS})，等待 {backoff_time}秒...")
-
-    # 停止现有隧道
-    stop_tunnel(tunnel_name)
 
     # 等待退避时间
     time.sleep(backoff_time)
@@ -571,28 +597,20 @@ def monitor_tunnel(tunnel_name: str):
                 consecutive_failures = 0
                 continue
 
-            # 健康检查失败时，先确认进程是否还活着，避免误杀活跃隧道
+            # 健康检查失败时，仅当进程已不在运行才重启，避免误杀活跃隧道
             proc_alive = check_tunnel_process(tunnel_name)
-            if proc_alive:
-                connected, detail = check_tunnel_connections(tunnel_name)
-                if connected:
-                    log("WARNING", f"健康检查失败但隧道仍有活跃连接，跳过重启。原因：{detail}")
-                    consecutive_failures = 0
-                    continue
-                # 进程在，但无连接，可能是暂时抖动，先累积计数
-
-            consecutive_failures += 1
-            log("WARNING", f"隧道健康检查失败 (连续失败: {consecutive_failures})")
-
-            # 只有当进程不在运行，或连续失败达到阈值时才重启，避免误重启
-            if (not proc_alive and consecutive_failures >= 1) or consecutive_failures >= 3:
-                log("WARNING", "连续健康检查失败，尝试重启隧道")
+            if not proc_alive:
+                log("WARNING", "检测到隧道进程已退出，尝试重启")
                 if restart_tunnel_with_backoff(tunnel_name):
                     consecutive_failures = 0
                 else:
                     log("ERROR", "隧道重启失败")
-                    # 等待更长时间后再试
                     time.sleep(60)
+                continue
+
+            # 进程仍在运行，但健康检查失败，记录并跳过重启，避免误杀
+            consecutive_failures += 1
+            log("WARNING", f"隧道健康检查失败 (进程仍在运行，连续失败: {consecutive_failures})，跳过重启")
 
         except KeyboardInterrupt:
             log("INFO", "接收到键盘中断")
@@ -635,7 +653,6 @@ def main():
         import traceback
         log("ERROR", traceback.format_exc())
     finally:
-        stop_tunnel(tunnel_name)
         log("INFO", "监控服务已停止")
 
 if __name__ == "__main__":

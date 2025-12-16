@@ -1,0 +1,40 @@
+[Unit]
+Description=Cloudflared Tunnel Monitor Service (Improved)
+After=network-online.target
+Wants=network-online.target
+StartLimitIntervalSec=0
+
+[Service]
+Type=simple
+User=zhukunren
+Group=zhukunren
+WorkingDirectory=/home/zhukunren/桌面/项目/内网穿透
+
+# 使用改进的监控脚本
+ExecStart=/usr/bin/python3 /home/zhukunren/桌面/项目/内网穿透/app/tunnel_monitor_improved.py homepage
+
+# 自动重启配置
+Restart=always
+RestartSec=30
+StartLimitBurst=3
+StartLimitInterval=60
+
+# 环境变量
+Environment="PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"
+Environment="PYTHONUNBUFFERED=1"
+Environment="QUIC_GO_UDP_RECEIVE_BUFFER_SIZE=7340032"
+
+# 资源限制
+LimitNOFILE=65535
+LimitNPROC=4096
+
+# 日志配置
+StandardOutput=append:/home/zhukunren/桌面/项目/内网穿透/logs/tunnel_service_improved.log
+StandardError=append:/home/zhukunren/桌面/项目/内网穿透/logs/tunnel_service_improved.error.log
+
+# 超时配置
+TimeoutStartSec=90
+TimeoutStopSec=90
+
+[Install]
+WantedBy=multi-user.target
