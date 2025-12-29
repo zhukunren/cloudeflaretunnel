@@ -115,7 +115,19 @@ class TunnelSupervisor:
         except Exception as exc:
             raise RuntimeError(f"无法解析 {self.config_path}: {exc}") from exc
 
-        self.cloudflared_path = data.get("cloudflared_path") or self._discover_cloudflared()
+        configured_path = str(data.get("cloudflared_path") or "").strip()
+        discovered_path = self._discover_cloudflared()
+        cloudflared_path = configured_path or (discovered_path or "")
+
+        # 配置可能来自其他系统（例如 Linux 路径），此处做一次兜底校验，避免启动阶段直接失败。
+        if configured_path and cf.version(configured_path) is None:
+            self._log(
+                "WARNING",
+                f"config/tunnels.json 中 cloudflared_path 无效：{configured_path}，将自动使用探测路径",
+            )
+            cloudflared_path = discovered_path or ""
+
+        self.cloudflared_path = cloudflared_path
         if not self.cloudflared_path:
             raise RuntimeError("无法确定 cloudflared 可执行文件路径，请在 config/tunnels.json 中设置 cloudflared_path")
         self.cloudflared_path = str(self.cloudflared_path)

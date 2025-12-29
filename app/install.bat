@@ -1,6 +1,10 @@
 @echo off
 REM Cloudflare Tunnel Manager - Windows 快速安装脚本
 
+set "SCRIPT_DIR=%~dp0"
+for %%I in ("%SCRIPT_DIR%..") do set "REPO_ROOT=%%~fI"
+cd /d "%REPO_ROOT%"
+
 echo ================================
 echo Cloudflare Tunnel Manager 安装
 echo ================================
@@ -21,17 +25,18 @@ echo ✓ Python 已安装
 REM 创建虚拟环境
 echo.
 echo 2. 创建虚拟环境...
-if exist venv (
+set "VENV_DIR=.venv"
+if exist "%VENV_DIR%" (
     echo 虚拟环境已存在,跳过创建
 ) else (
-    python -m venv venv
+    python -m venv "%VENV_DIR%"
     echo ✓ 虚拟环境创建成功
 )
 
 REM 激活虚拟环境
 echo.
 echo 3. 激活虚拟环境...
-call venv\Scripts\activate.bat
+call "%VENV_DIR%\Scripts\activate.bat"
 echo ✓ 虚拟环境已激活
 
 REM 升级pip
@@ -43,14 +48,14 @@ echo ✓ pip 已升级
 REM 安装依赖
 echo.
 echo 5. 安装依赖...
-pip install -r requirements.txt
+pip install -r app\requirements.txt
 echo ✓ 依赖安装完成
 
 REM 检查cloudflared
 echo.
 echo 6. 检查cloudflared...
-if exist "..\cloudflared.exe" (
-    ..\cloudflared.exe --version
+if exist "cloudflared.exe" (
+    cloudflared.exe --version
     echo ✓ cloudflared 已找到
 ) else (
     echo ⚠ cloudflared.exe 未找到
@@ -61,7 +66,6 @@ if exist "..\cloudflared.exe" (
 REM 创建必要目录
 echo.
 echo 7. 创建目录结构...
-if not exist assets mkdir assets
 if not exist config mkdir config
 if not exist logs mkdir logs
 if not exist tunnels mkdir tunnels
@@ -78,7 +82,7 @@ echo   python -m app.main          # 现代UI
 echo   python -m app.main --classic # 经典UI
 echo.
 echo 查看文档:
-echo   type README.md               # 项目说明
-echo   type USAGE.md                # 使用指南
+echo   type README.md                   # 项目说明
+echo   type docs\TROUBLESHOOTING.md     # 故障排查
 echo.
 pause

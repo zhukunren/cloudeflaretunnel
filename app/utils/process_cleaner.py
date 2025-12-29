@@ -12,6 +12,7 @@ import time
 import sys
 from pathlib import Path
 from datetime import datetime
+from typing import Optional
 
 
 class ProcessCleaner:
@@ -71,27 +72,31 @@ class ProcessCleaner:
         ]
         return any(keyword in cmd for keyword in keywords)
 
-    def _is_systemd_managed(self, pid: int) -> bool:
-        """检查进程是否由systemd管理"""
+    def _systemd_unit_from_pid(self, pid: int) -> Optional[str]:
+        """从 /proc/<pid>/cgroup 推断 systemd unit（仅识别 *.service）。"""
         try:
-            result = subprocess.run(
-                ['systemctl', '--user', 'status', 'cloudflared-homepage.service'],
-                capture_output=True,
-                text=True,
-                timeout=2
-            )
-            # 如果服务运行中且PID匹配，则说明由systemd管理
-            if result.returncode == 0 and 'Main PID' in result.stdout:
-                for line in result.stdout.split('\n'):
-                    if 'Main PID' in line:
-                        try:
-                            systemd_pid = int(line.split()[-1])
-                            return pid == systemd_pid
-                        except (ValueError, IndexError):
-                            pass
+            cgroup_path = Path(f"/proc/{pid}/cgroup")
+            if not cgroup_path.exists():
+                return None
+            content = cgroup_path.read_text(encoding="utf-8", errors="ignore")
         except Exception:
-            pass
-        return False
+            return None
+
+        for line in content.splitlines():
+            if ".service" not in line:
+                continue
+            parts = line.split(":", 2)
+            cgroup = parts[-1] if parts else ""
+            if ".service" not in cgroup:
+                continue
+            unit = cgroup.split("/")[-1]
+            if unit.endswith(".service"):
+                return unit
+        return None
+
+    def _is_systemd_managed(self, pid: int) -> bool:
+        """检查进程是否由 systemd 服务单元管理（避免误杀 systemd 运行的监控/守护进程）。"""
+        return self._systemd_unit_from_pid(pid) is not None
 
     def _kill_process(self, pid: int, force: bool = False) -> bool:
         """安全地杀死进程
@@ -104,6 +109,17 @@ class ProcessCleaner:
             成功返回True，失败返回False
         """
         try:
+            if os.name == "nt":
+                flags = ["/F"] if force else []
+                subprocess.run(
+                    ["taskkill", "/PID", str(pid), "/T", *flags],
+                    stdout=subprocess.DEVNULL,
+                    stderr=subprocess.DEVNULL,
+                    check=False,
+                )
+                signal_name = "taskkill /F" if force else "taskkill"
+                self._log("INFO", f"已发送 {signal_name} 给进程 {pid}")
+                return True
             signal_type = signal.SIGKILL if force else signal.SIGTERM
             os.kill(pid, signal_type)
             signal_name = "SIGKILL" if force else "SIGTERM"
@@ -136,8 +152,8 @@ class ProcessCleaner:
                 timeout=5
             )
 
-            monitor_pids = []
-            systemd_pid = None
+            monitor_processes = []
+            systemd_pids = set()
 
             for line in result.stdout.split('\n'):
                 if not line.strip():
@@ -155,17 +171,36 @@ class ProcessCleaner:
 
                 # 识别监控脚本进程
                 if self._is_tunnel_monitor_process(cmd):
-                    monitor_pids.append(pid)
+                    monitor_processes.append((pid, cmd))
+                    if self._is_systemd_managed(pid):
+                        systemd_pids.add(pid)
 
-                # 识别systemd管理的进程
-                if 'tunnel_monitor_improved.py' in cmd and self._is_systemd_managed(pid):
-                    systemd_pid = pid
+            monitor_pids = [pid for pid, _ in monitor_processes]
+            if not monitor_pids:
+                self._log("INFO", "没有发现监控脚本进程")
+                return 0
 
-            # 清理重复的监控脚本（保留systemd管理的那个）
+            keep_pids = set()
+            if systemd_pids:
+                keep_pids = set(systemd_pids)
+            elif len(monitor_pids) <= 1:
+                self._log("INFO", "只发现 1 个监控脚本进程且非 systemd 管理，跳过清理")
+                return 0
+            else:
+                keep_pid = min(monitor_pids)
+                keep_pids = {keep_pid}
+                self._log("WARNING", f"未检测到 systemd 管理的监控进程，将保留 PID {keep_pid} 并清理其他进程")
+
+            # 清理重复的监控脚本（保留 systemd 管理的进程/或保留一个）
             killed_count = 0
             for pid in monitor_pids:
-                if pid == systemd_pid:
-                    self._log("DEBUG", f"保留 systemd 管理的进程 {pid}")
+                if pid in keep_pids or pid == os.getpid():
+                    if pid in keep_pids:
+                        unit = self._systemd_unit_from_pid(pid)
+                        msg = f"保留 systemd 管理的进程 {pid}" if unit else f"保留进程 {pid}"
+                        if unit:
+                            msg += f" ({unit})"
+                        self._log("DEBUG", msg)
                     continue
 
                 info = self._get_process_info(pid)
@@ -241,37 +276,29 @@ class ProcessCleaner:
         Returns:
             服务运行中返回True，否则False
         """
+        if os.name == "nt":
+            self._log("INFO", "Windows 环境，跳过 systemd 服务检查。")
+            return True
+
         self._log("INFO", "检查 systemd 服务状态...")
 
-        try:
-            result = subprocess.run(
-                ['systemctl', '--user', 'status', 'cloudflared-homepage.service'],
-                capture_output=True,
-                text=True,
-                timeout=2
-            )
+        candidates = [
+            (["systemctl", "is-active", "--quiet", "tunnel-monitor-improved.service"], "tunnel-monitor-improved.service"),
+            (["systemctl", "is-active", "--quiet", "tunnel-supervisor.service"], "tunnel-supervisor.service"),
+            (["systemctl", "--user", "is-active", "--quiet", "cloudflared-homepage.service"], "cloudflared-homepage.service"),
+        ]
 
-            if result.returncode == 0:
-                self._log("INFO", "✓ systemd 隧道服务正常运行")
-                return True
-            else:
-                self._log("WARNING", "⚠ systemd 隧道服务未运行，尝试启动...")
-                # 尝试启动服务
-                start_result = subprocess.run(
-                    ['systemctl', '--user', 'start', 'cloudflared-homepage.service'],
-                    capture_output=True,
-                    timeout=5
-                )
-                if start_result.returncode == 0:
-                    time.sleep(2)  # 等待服务启动
-                    self._log("INFO", "✓ systemd 隧道服务已启动")
+        for cmd, unit in candidates:
+            try:
+                result = subprocess.run(cmd, capture_output=True, text=True, timeout=2)
+                if result.returncode == 0:
+                    self._log("INFO", f"✓ systemd 服务运行中: {unit}")
                     return True
-                else:
-                    self._log("ERROR", "✗ 启动 systemd 隧道服务失败")
-                    return False
-        except Exception as e:
-            self._log("ERROR", f"检查 systemd 服务失败: {e}")
-            return False
+            except Exception:
+                continue
+
+        self._log("WARNING", "⚠ 未检测到运行中的 systemd 隧道服务（建议启用 tunnel-monitor-improved.service 或 tunnel-supervisor.service）")
+        return False
 
     def cleanup_all(self) -> dict:
         """执行全部清理操作
@@ -279,6 +306,14 @@ class ProcessCleaner:
         Returns:
             清理结果字典
         """
+        if os.name == "nt":
+            self._log("INFO", "Windows 环境，跳过进程清理流程（systemd/ps 不适用）。")
+            return {
+                'duplicate_monitors_killed': 0,
+                'zombies_found': 0,
+                'systemd_service_ok': True,
+            }
+
         self._log("INFO", "=" * 60)
         self._log("INFO", "开始执行进程清理流程")
         self._log("INFO", "=" * 60)
@@ -301,6 +336,19 @@ class ProcessCleaner:
 
 def cleanup_on_startup():
     """在应用启动时执行清理"""
+    if os.name == "nt":
+        try:
+            try:
+                from .process_tracker import ProcessTracker  # type: ignore
+            except Exception:
+                from process_tracker import ProcessTracker  # type: ignore
+
+            base_dir = Path(__file__).resolve().parent.parent.parent
+            ProcessTracker(base_dir).cleanup_dead()
+        except Exception:
+            pass
+        return
+
     try:
         cleaner = ProcessCleaner()
         cleaner.cleanup_all()

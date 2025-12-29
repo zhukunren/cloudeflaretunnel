@@ -7,6 +7,8 @@ from enum import Enum
 from typing import Callable, Optional
 from pathlib import Path
 
+from .paths import get_logs_dir
+
 
 class LogLevel(Enum):
     """日志级别"""
@@ -22,7 +24,7 @@ class LogManager:
     def __init__(self, max_lines: int = 1000, save_to_file: bool = False, log_dir: Optional[Path] = None):
         self.max_lines = max_lines
         self.save_to_file = save_to_file
-        self.log_dir = log_dir or (Path.cwd() / "logs")
+        self.log_dir = log_dir or get_logs_dir()
         self.current_level = LogLevel.INFO
         self._log_buffer: list[tuple[datetime, LogLevel, str]] = []
         self._callbacks: list[Callable] = []

@@ -155,9 +155,10 @@ class ProcessTracker:
 
     def cleanup_dead(self):
         """删除对应进程已经消失的 PID 文件"""
-        with self._locked() as locked:
+        # 清理属于“最佳努力”行为，不应阻塞 GUI 主线程；获取不到锁则跳过即可
+        with self._lock.locked(timeout=0.0) as locked:
             if not locked:
-                print("ProcessTracker: 清理死 PID 时未能获取锁，可能存在竞争。")
+                return
             for record in list(self.list_records()):
                 if record.pid <= 0 or not record.alive:
                     if record.path:

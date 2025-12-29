@@ -7,6 +7,9 @@ import sys
 import os
 from pathlib import Path
 
+APP_DIR = Path(__file__).resolve().parent
+PROJECT_ROOT = APP_DIR.parent
+
 
 def check_python_version():
     """检查Python版本"""
@@ -95,19 +98,34 @@ def check_cloudflared():
 
 def check_directories():
     """检查必要目录"""
-    dirs = ['config', 'logs', 'tunnels', 'assets', 'components', 'utils']
+    runtime_dirs = [
+        ("config", PROJECT_ROOT / "config"),
+        ("logs", PROJECT_ROOT / "logs"),
+        ("tunnels", PROJECT_ROOT / "tunnels"),
+    ]
 
-    for d in dirs:
-        path = Path(__file__).parent / d
+    code_dirs = [
+        ("app/assets", APP_DIR / "assets"),
+        ("app/components", APP_DIR / "components"),
+        ("app/utils", APP_DIR / "utils"),
+        ("app/config", APP_DIR / "config"),
+    ]
+
+    for label, path in runtime_dirs + code_dirs:
         if path.exists():
-            print(f"✓ {d}/")
-        else:
-            print(f"⚠ {d}/ - 不存在,将自动创建")
-            try:
-                path.mkdir(parents=True, exist_ok=True)
-                print(f"  已创建: {d}/")
-            except Exception as e:
-                print(f"  创建失败: {e}")
+            print(f"✓ {label}/")
+            continue
+
+        if label.startswith("app/"):
+            print(f"❌ {label}/ - 不存在（代码目录缺失）")
+            continue
+
+        print(f"⚠ {label}/ - 不存在,将自动创建")
+        try:
+            path.mkdir(parents=True, exist_ok=True)
+            print(f"  已创建: {label}/")
+        except Exception as e:
+            print(f"  创建失败: {e}")
 
     return True
 
@@ -201,7 +219,10 @@ def main():
     # 启动应用
     try:
         print("\n" + "=" * 60)
-        from modern_gui import run_modern_app
+        try:
+            from .modern_gui import run_modern_app  # type: ignore
+        except Exception:
+            from modern_gui import run_modern_app  # type: ignore
         run_modern_app()
     except KeyboardInterrupt:
         print("\n\n用户中断")

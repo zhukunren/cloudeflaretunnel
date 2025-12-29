@@ -24,6 +24,14 @@ except Exception:
     # 容错导入，避免脚本模式下失败
     FileLock = None
 
+try:
+    from . import cloudflared_cli as cf  # type: ignore
+except Exception:
+    try:
+        import cloudflared_cli as cf  # type: ignore
+    except Exception:
+        cf = None  # type: ignore
+
 # 配置参数
 TUNNEL_NAME = "homepage"  # 默认隧道名称
 CHECK_INTERVAL = 30  # 检查间隔（秒）- 缩短到30秒
@@ -47,9 +55,14 @@ def get_cloudflared_path() -> str:
                 return path
         except Exception:
             pass
-    local_path = PROJECT_ROOT / "cloudflared"
-    if local_path.exists():
-        return str(local_path)
+
+    candidates = [PROJECT_ROOT / "cloudflared"]
+    if os.name == "nt":
+        candidates.insert(0, PROJECT_ROOT / "cloudflared.exe")
+    for local_path in candidates:
+        if local_path.exists():
+            return str(local_path)
+
     return "cloudflared"
 
 
@@ -136,6 +149,26 @@ def get_tunnel_config_path(tunnel_name: str) -> Path:
     base_path = Path(__file__).parent.parent
     config_path = base_path / "tunnels" / tunnel_name / "config.yml"
     return config_path
+
+def get_tunnel_protocol(tunnel_name: str, default: str = "http2") -> str:
+    """从隧道配置中读取 protocol（默认 http2，避免 QUIC/UDP 不稳定导致无连接）。"""
+    config_path = get_tunnel_config_path(tunnel_name)
+    if not config_path.exists():
+        return default
+    try:
+        text = config_path.read_text(encoding="utf-8", errors="ignore")
+    except Exception:
+        return default
+
+    for raw in text.splitlines():
+        line = raw.strip()
+        if not line or line.startswith("#"):
+            continue
+        m = re.match(r"^protocol\s*:\s*([^\s#]+)\s*$", line, flags=re.IGNORECASE)
+        if m:
+            value = m.group(1).strip().strip("'\"")
+            return value or default
+    return default
 
 def check_metrics_endpoint() -> dict:
     """检查cloudflared metrics端点获取隧道状态"""
@@ -227,6 +260,11 @@ def check_tunnel_connections(tunnel_name: str) -> tuple[bool | None, str]:
 
 def check_tunnel_process(tunnel_name: str) -> bool:
     """检查隧道进程是否在运行"""
+    if cf:
+        try:
+            return any(t.get("name") == tunnel_name for t in cf.get_running_tunnels())
+        except Exception:
+            pass
     try:
         result = subprocess.run(
             ["pgrep", "-f", f"tunnel.*run.*{tunnel_name}"],
@@ -238,7 +276,7 @@ def check_tunnel_process(tunnel_name: str) -> bool:
             pids = result.stdout.decode().strip().split('\n')
             if pids and pids[0]:
                 return True
-        return False
+            return False
 
     except Exception:
         return False
@@ -374,10 +412,13 @@ def start_tunnel(tunnel_name: str) -> subprocess.Popen:
         # 构建启动命令，添加更多参数
         cloudflared = get_cloudflared_path()
         metrics_port = _current_metrics_port(tunnel_name)
+        protocol = get_tunnel_protocol(tunnel_name)
+        log("INFO", f"启动协议: {protocol}")
         cmd = [
             cloudflared,
             "--config", str(config_path),
             "--metrics", f"localhost:{metrics_port}",
+            "--protocol", protocol,
             "tunnel", "run",
             tunnel_name
         ]
@@ -500,31 +541,38 @@ def stop_tunnel(tunnel_name: str = None):
             cloudflared_process = None
 
     # 额外清理：仅终止命令行中明确包含 "tunnel run <name>" 的残留进程，避免前缀误杀
-    try:
-        ps = subprocess.run(
-            ["ps", "-eo", "pid,command"],
-            capture_output=True,
-            text=True,
-            timeout=5
-        )
-        if ps.returncode == 0:
-            pattern = re.compile(rf"\btunnel\s+run\s+{re.escape(target_tunnel)}(\s|$)")
-            for line in ps.stdout.splitlines():
-                parts = line.strip().split(None, 1)
-                if len(parts) != 2:
-                    continue
-                pid_str, cmd = parts
-                if not pattern.search(cmd):
-                    continue
-                try:
-                    pid = int(pid_str)
-                    if pid == os.getpid():
+    if os.name == "nt":
+        try:
+            if cf:
+                cf.kill_tunnel_by_name(target_tunnel)
+        except Exception as e:
+            log("DEBUG", f"清理残留进程失败: {e}")
+    else:
+        try:
+            ps = subprocess.run(
+                ["ps", "-eo", "pid,command"],
+                capture_output=True,
+                text=True,
+                timeout=5
+            )
+            if ps.returncode == 0:
+                pattern = re.compile(rf"\btunnel\s+run\s+{re.escape(target_tunnel)}(\s|$)")
+                for line in ps.stdout.splitlines():
+                    parts = line.strip().split(None, 1)
+                    if len(parts) != 2:
                         continue
-                    os.kill(pid, signal.SIGTERM)
-                except Exception:
-                    continue
-    except Exception as e:
-        log("DEBUG", f"清理残留进程失败: {e}")
+                    pid_str, cmd = parts
+                    if not pattern.search(cmd):
+                        continue
+                    try:
+                        pid = int(pid_str)
+                        if pid == os.getpid():
+                            continue
+                        os.kill(pid, signal.SIGTERM)
+                    except Exception:
+                        continue
+        except Exception as e:
+            log("DEBUG", f"清理残留进程失败: {e}")
 
 def restart_tunnel_with_backoff(tunnel_name: str, attempt: int = 0) -> bool:
     """带指数退避的重启隧道"""
@@ -534,10 +582,14 @@ def restart_tunnel_with_backoff(tunnel_name: str, attempt: int = 0) -> bool:
         log("ERROR", f"已达到最大重启次数 ({MAX_RESTART_ATTEMPTS})")
         return False
 
-    # 如果进程仍在运行，避免发送 SIGTERM 误杀，直接跳过
+    # 如果进程仍在运行但无活跃连接，先停止再重启（避免僵死进程一直占用导致长期无连接）
     if check_tunnel_process(tunnel_name):
-        log("WARNING", "检测到隧道进程仍在运行，跳过自动重启以避免误杀")
-        return False
+        log("WARNING", "检测到隧道进程仍在运行，将先停止再重启")
+        stop_tunnel(tunnel_name)
+        for _ in range(10):
+            if not check_tunnel_process(tunnel_name):
+                break
+            time.sleep(1)
 
     # 检查重启冷却时间
     current_time = time.time()
@@ -608,9 +660,19 @@ def monitor_tunnel(tunnel_name: str):
                     time.sleep(60)
                 continue
 
-            # 进程仍在运行，但健康检查失败，记录并跳过重启，避免误杀
+            # 进程仍在运行，但健康检查失败
             consecutive_failures += 1
-            log("WARNING", f"隧道健康检查失败 (进程仍在运行，连续失败: {consecutive_failures})，跳过重启")
+
+            # 连续失败超过阈值，强制重启（进程僵死但连接已断开的情况）
+            MAX_CONSECUTIVE_FAILURES = 5
+            if consecutive_failures >= MAX_CONSECUTIVE_FAILURES:
+                log("WARNING", f"连续失败 {consecutive_failures} 次，强制重启隧道进程")
+                if restart_tunnel_with_backoff(tunnel_name):
+                    consecutive_failures = 0
+                else:
+                    log("ERROR", "隧道强制重启失败")
+            else:
+                log("WARNING", f"隧道健康检查失败 (进程仍在运行，连续失败: {consecutive_failures}/{MAX_CONSECUTIVE_FAILURES})，暂不重启")
 
         except KeyboardInterrupt:
             log("INFO", "接收到键盘中断")

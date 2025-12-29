@@ -28,6 +28,7 @@ try:
     from .components.widgets import ModernButton, IconButton, Card, Badge, StatusIndicator, SearchBox
     from .config.settings import Settings
     from .utils.logger import LogManager, LogLevel
+    from .utils.paths import get_repo_root, get_persistent_logs_dir, get_tunnels_dir
     from .utils.process_tracker import ProcessTracker, SupervisorLock
     from .utils.supervisor_client import SupervisorClient
 except (ImportError, ValueError):
@@ -39,6 +40,7 @@ except (ImportError, ValueError):
     from components.widgets import ModernButton, IconButton, Card, Badge, StatusIndicator, SearchBox
     from config.settings import Settings
     from utils.logger import LogManager, LogLevel
+    from utils.paths import get_repo_root, get_persistent_logs_dir, get_tunnels_dir
     from utils.process_tracker import ProcessTracker, SupervisorLock
     from utils.supervisor_client import SupervisorClient
 
@@ -78,6 +80,7 @@ class ModernTunnelList(tk.Frame):
         super().__init__(parent, bg=Theme.BG_CARD)
         self.on_select = on_select
         self.items = []
+        self._item_by_name: dict[str, dict] = {}
         self.selected_index = None
         self.empty_state = None
 
@@ -119,29 +122,42 @@ class ModernTunnelList(tk.Frame):
         """更新特定隧道的状态显示"""
         # running=True 但 healthy=False 表示进程仍在，但无活跃连接
         state_active = running and healthy is True
-        state_warning = running and healthy is not True
-        for item_data in self.items:
-            if item_data["data"].get("name") == tunnel_name:
-                # 更新状态条颜色
-                status_bar = item_data.get("status_bar")
-                if status_bar:
-                    if state_active:
-                        status_bar.configure(bg=Theme.SUCCESS)
-                    elif state_warning:
-                        status_bar.configure(bg=Theme.WARNING)
-                    else:
-                        status_bar.configure(bg=Theme.BORDER)
+        state_unknown = running and healthy is None
+        state_warning = running and healthy is False
 
-                # 更新徽章
-                badge_label = item_data.get("badge_label")
-                if badge_label:
-                    if state_active:
-                        badge_label.configure(text="● 已激活", bg=Theme.SUCCESS_BG, fg=Theme.SUCCESS)
-                    elif state_warning:
-                        badge_label.configure(text="! 无连接", bg=Theme.WARNING_BG, fg=Theme.WARNING)
-                    else:
-                        badge_label.configure(text="○ 未激活", bg=Theme.BG_HOVER, fg=Theme.TEXT_MUTED)
-                break
+        item_data = self._item_by_name.get(tunnel_name)
+        if not item_data:
+            for candidate in self.items:
+                if candidate["data"].get("name") == tunnel_name:
+                    item_data = candidate
+                    break
+
+        if not item_data:
+            return
+
+        # 更新状态条颜色
+        status_bar = item_data.get("status_bar")
+        if status_bar:
+            if state_active:
+                status_bar.configure(bg=Theme.SUCCESS)
+            elif state_warning:
+                status_bar.configure(bg=Theme.WARNING)
+            elif state_unknown:
+                status_bar.configure(bg=Theme.INFO)
+            else:
+                status_bar.configure(bg=Theme.BORDER)
+
+        # 更新徽章
+        badge_label = item_data.get("badge_label")
+        if badge_label:
+            if state_active:
+                badge_label.configure(text="● 已激活", bg=Theme.SUCCESS_BG, fg=Theme.SUCCESS)
+            elif state_warning:
+                badge_label.configure(text="! 无连接", bg=Theme.WARNING_BG, fg=Theme.WARNING)
+            elif state_unknown:
+                badge_label.configure(text="… 检测中", bg=Theme.INFO_BG, fg=Theme.INFO)
+            else:
+                badge_label.configure(text="○ 未激活", bg=Theme.BG_HOVER, fg=Theme.TEXT_MUTED)
 
     def refresh_all_status(self):
         """刷新所有隧道的状态"""
@@ -357,7 +373,7 @@ class ModernTunnelList(tk.Frame):
             widget.bind("<Button-1>", on_click)
 
         # 保存到列表
-        self.items.append({
+        item_payload = {
             "card": card,
             "container": container,
             "data": tunnel_data,
@@ -369,7 +385,11 @@ class ModernTunnelList(tk.Frame):
                 "meta_row": meta_row,
                 "status_badge": badge_label
             }
-        })
+        }
+        self.items.append(item_payload)
+        tunnel_name = tunnel_data.get("name")
+        if tunnel_name:
+            self._item_by_name[str(tunnel_name)] = item_payload
 
     def select_item(self, index):
         """选择隧道项 - 优化视觉反馈"""
@@ -395,6 +415,7 @@ class ModernTunnelList(tk.Frame):
         for widget in self.scrollable_frame.winfo_children():
             widget.destroy()
         self.items = []
+        self._item_by_name = {}
         self.selected_index = None
         self.empty_state = None
 
@@ -475,6 +496,7 @@ class ModernTunnelManager(tk.Tk):
         self._auto_heal_pending: set[str] = set()
         self._status_refresh_running = False  # 防止后台刷新并发执行
         self._tunnel_operation_in_progress = False  # 防止启动/停止操作重复触发
+        self._tunnel_list_refreshing = False  # 防止刷新隧道列表并发执行
 
         # 绑定窗口关闭事件
         self.protocol("WM_DELETE_WINDOW", self._on_closing)
@@ -566,8 +588,11 @@ class ModernTunnelManager(tk.Tk):
         }
         tag = level_map.get(level, "info")
 
-        # 在主线程中更新UI
-        self.after(0, lambda: self._append_log(message + "\n", tag))
+        # 统一进入队列，由主线程批量刷新，避免卡顿/线程不安全
+        try:
+            self.proc_queue.put(("logger", message + "\n", tag))
+        except Exception:
+            pass
 
     def _build_modern_ui(self):
         """构建现代化UI - 2025重构版"""
@@ -1325,31 +1350,42 @@ class ModernTunnelManager(tk.Tk):
 
         # 启动后台线程执行耗时操作
         self._status_refresh_running = True
-        threading.Thread(target=self._background_status_check, daemon=True).start()
+        cloudflared_path = self.cloudflared_path.get().strip() or cf.find_cloudflared()
+        threading.Thread(
+            target=self._background_status_check,
+            args=(cloudflared_path,),
+            daemon=True,
+        ).start()
 
-    def _background_status_check(self):
+    def _background_status_check(self, cloudflared_path: str | None):
         """后台线程：执行耗时的状态检查操作"""
         try:
             # 获取运行中的隧道列表（执行 ps 命令）
             running_tunnels_list = cf.get_running_tunnels()
 
             # 补充健康检查信息（执行 cloudflared tunnel info）
-            cloudflared_path = self.cloudflared_path.get().strip() or cf.find_cloudflared()
+            cache_ttl = int(self.settings.get("tunnel.health_cache_ttl", 30) or 30)
+            test_timeout = int(self.settings.get("tunnel.health_check_timeout", 12) or 12)
             for t in running_tunnels_list:
                 tunnel_name = t["name"]
                 # 使用缓存减少调用次数
                 now = time.time()
                 cached = self._health_cache.get(tunnel_name)
-                if cached and now - cached.get("ts", 0) < 10:
+                if cached and now - cached.get("ts", 0) < cache_ttl:
                     ok, detail = cached.get("ok"), cached.get("detail", "")
                 else:
                     if cloudflared_path:
-                        ok, detail = cf.test_connection(cloudflared_path, tunnel_name, timeout=25)
+                        ok, detail = cf.test_connection(cloudflared_path, tunnel_name, timeout=test_timeout)
                         self._health_cache[tunnel_name] = {"ok": ok, "detail": detail, "ts": now}
                     else:
                         ok, detail = None, "未配置 cloudflared 路径"
 
-                t["healthy"] = (ok is True)
+                if ok is True:
+                    t["healthy"] = True
+                elif ok is False:
+                    t["healthy"] = False
+                else:
+                    t["healthy"] = None
                 if detail:
                     t["detail"] = detail
                 t["_health_ok"] = ok  # 临时存储用于主线程处理
@@ -1419,7 +1455,7 @@ class ModernTunnelManager(tk.Tk):
                 self.running_tunnels[name] = {
                     "name": name,
                     "pid": proc.pid,
-                    "healthy": False,
+                    "healthy": None,
                 }
                 added = True
 
@@ -1437,7 +1473,7 @@ class ModernTunnelManager(tk.Tk):
         capture_output = not persist_enabled
         log_file = None
         if persist_enabled:
-            log_dir = Path.cwd() / "logs" / "persistent"
+            log_dir = get_persistent_logs_dir()
             log_dir.mkdir(parents=True, exist_ok=True)
             log_file = log_dir / f"{tunnel_name}.log"
 
@@ -1488,7 +1524,18 @@ class ModernTunnelManager(tk.Tk):
             for i in range(12):
                 time.sleep(1)
                 if proc.poll() is not None:
-                    last_detail = f"cloudflared 退出码 {proc.returncode}"
+                    output_text = ""
+                    if getattr(proc, "stdout", None):
+                        try:
+                            output_text, _ = proc.communicate(timeout=0.2)
+                        except Exception:
+                            output_text = ""
+
+                    if output_text:
+                        tail = "\n".join((output_text.strip().splitlines() or [])[-40:])
+                        last_detail = f"cloudflared 退出码 {proc.returncode}\n{tail}"
+                    else:
+                        last_detail = f"cloudflared 退出码 {proc.returncode}"
                     break
                 if i % 2 == 1:
                     ok, detail = cf.test_connection(cloudflared_path, tunnel_name, timeout=20)
@@ -2012,12 +2059,8 @@ class ModernTunnelManager(tk.Tk):
 
     def _run_download_flow(self, mode: str):
         """共享的下载/更新流程"""
-        if cf._is_windows():
-            title = "检查更新" if mode == "update" else "下载"
-            messagebox.showinfo(title, "该功能仅适用于 Linux/macOS 环境。")
-            return
-
-        target = Path.cwd() / "cloudflared"
+        target_name = "cloudflared.exe" if cf._is_windows() else "cloudflared"
+        target = get_repo_root() / target_name
         start_log = "正在检查 cloudflared 更新...\n" if mode == "update" else "正在下载 cloudflared...\n"
         busy_status = "检查更新中…" if mode == "update" else "下载准备中…"
         success_label = "更新完成" if mode == "update" else "下载完成"
@@ -2031,7 +2074,7 @@ class ModernTunnelManager(tk.Tk):
             self.after(0, lambda: self.status_var.set(f"下载中… {pct}%"))
 
         def _worker():
-            ok, msg, version = cf.download_cloudflared_linux(target, progress_cb=progress)
+            ok, msg, version = cf.download_cloudflared(target, progress_cb=progress)
 
             def _finish():
                 cert_ok, _, cert_detail = self._cert_status_summary()
@@ -2129,25 +2172,53 @@ class ModernTunnelManager(tk.Tk):
             self.status_var.set("请先设置 cloudflared 路径")
             return
 
+        if self._tunnel_list_refreshing:
+            self.status_var.set("刷新中…")
+            return
+
+        self._tunnel_list_refreshing = True
         self.tunnel_list.set_tunnels([], "正在刷新隧道列表…", "cloudflared 正在返回最新的隧道信息。")
         self._append_log("正在刷新隧道列表...\n", "info")
         self.logger.info("开始刷新隧道列表")
-        data = []
-        error_msg = None
-        try:
-            result = cf.list_tunnels(path, return_error=True)
-            if isinstance(result, tuple):
-                data, error_msg = result
-            else:
-                data, error_msg = result, None
-        except cf.CloudflaredBinaryError as e:
-            self._append_log(f"刷新隧道失败: {e}\n", "error")
-            self.logger.error(f"刷新隧道失败: {e}")
-            messagebox.showerror("cloudflared 不可用", str(e))
-            self.status_var.set("cloudflared 不可用")
-            self.tunnel_list.set_tunnels([], "加载失败", "请检查 cloudflared 是否可执行，或重新选择可执行文件。")
-            return
 
+        def _worker(cloudflared_path: str):
+            data: list[dict] = []
+            error_msg: str | None = None
+            binary_error: str | None = None
+
+            try:
+                result = cf.list_tunnels(cloudflared_path, return_error=True, timeout=15)
+                if isinstance(result, tuple):
+                    data, error_msg = result
+                else:
+                    data, error_msg = result, None
+            except cf.CloudflaredBinaryError as exc:
+                binary_error = str(exc)
+            except Exception as exc:
+                error_msg = str(exc)
+
+            def _finish():
+                self._tunnel_list_refreshing = False
+
+                if binary_error:
+                    self._append_log(f"刷新隧道失败: {binary_error}\n", "error")
+                    self.logger.error(f"刷新隧道失败: {binary_error}")
+                    messagebox.showerror("cloudflared 不可用", binary_error)
+                    self.status_var.set("cloudflared 不可用")
+                    self.tunnel_list.set_tunnels([], "加载失败", "请检查 cloudflared 是否可执行，或重新选择可执行文件。")
+                    return
+
+                self._apply_tunnel_list_result(data, error_msg)
+
+            try:
+                self.after(0, _finish)
+            except Exception:
+                self._tunnel_list_refreshing = False
+
+        threading.Thread(target=_worker, args=(path,), daemon=True).start()
+
+    def _apply_tunnel_list_result(self, data: list[dict], error_msg: str | None):
+        """应用隧道列表刷新结果（必须在主线程调用）"""
         # 无法访问 Cloudflare API 时，尝试读取本地配置作为离线列表
         if not data:
             local_tunnels = cf.load_local_tunnels(self._project_root)
@@ -2264,7 +2335,7 @@ class ModernTunnelManager(tk.Tk):
 
         if ok:
             # 同时删除配置目录
-            config_dir = Path.cwd() / "tunnels" / name
+            config_dir = get_tunnels_dir() / name
             if config_dir.exists():
                 try:
                     shutil.rmtree(config_dir)
@@ -2284,7 +2355,7 @@ class ModernTunnelManager(tk.Tk):
 
     def _config_path_for(self, tunnel_name: str) -> Path:
         """获取隧道配置文件路径"""
-        return Path.cwd() / "tunnels" / tunnel_name / "config.yml"
+        return get_tunnels_dir() / tunnel_name / "config.yml"
 
     def _extract_hostnames(self, cfg_path: Path) -> list[str]:
         """读取配置文件中的 hostname 列表"""
@@ -2374,7 +2445,10 @@ class ModernTunnelManager(tk.Tk):
         self.logger.info(f"配置编辑完成: {name}")
 
     def _start_selected(self):
-        """启动选中的隧道"""
+        """启动选中的隧道（后台执行，避免阻塞UI）"""
+        if self._tunnel_operation_in_progress:
+            return
+
         self._refresh_proc_state()
 
         path = self.cloudflared_path.get().strip()
@@ -2385,191 +2459,241 @@ class ModernTunnelManager(tk.Tk):
             return
 
         name = item.get("name", "unknown")
+        if not self._can_control_tunnel(name):
+            return
 
-        # 启动前清理可能残留的同名进程，避免端口/metrics 占用
-        self._cleanup_residual_tunnel(name)
-
-        # 检查是否已有同名隧道在运行
+        # 已在运行则不重复启动
         if self._is_tunnel_running(name):
             existing_info = self._get_running_tunnel_info(name)
-            if existing_info:
-                pid_info = f" (PID: {existing_info['pid']})"
-            else:
-                pid_info = ""
+            pid_info = f" (PID: {existing_info['pid']})" if existing_info and existing_info.get("pid") else ""
             messagebox.showinfo("提示", f"隧道 {name} 已在运行中{pid_info}")
             self._append_log(f"隧道 {name} 已在运行中{pid_info}\n", "warning")
             self.logger.warning(f"隧道 {name} 已在运行中")
             return
 
-        cfg = self._config_path_for(name)
         tid = cf.extract_tunnel_id(item)
-
         if not tid:
             self._append_log("无法获取隧道ID\n", "error")
             self.logger.error("无法获取隧道ID")
             return
 
-        # 检查配置文件是否存在
-        if cfg.exists():
-            # 验证配置文件中的UUID是否匹配
-            if not cf.validate_tunnel_config(cfg, tid):
-                self._append_log(f"检测到配置文件UUID不匹配，正在更新...\n", "warning")
-                self.logger.warning(f"配置文件UUID不匹配，尝试更新")
+        persist_enabled = bool(self.persist_var.get())
+        capture_output = not persist_enabled
+        log_file = None
+        if persist_enabled:
+            log_dir = get_persistent_logs_dir()
+            log_dir.mkdir(parents=True, exist_ok=True)
+            log_file = log_dir / f"{name}.log"
 
-                # 更新配置文件中的UUID
-                if cf.update_config_tunnel_id(cfg, tid):
-                    self._append_log(f"配置文件UUID已更新为: {tid}\n", "success")
-                    self.logger.info(f"配置文件UUID已更新为: {tid}")
-                else:
-                    # 如果更新失败，重新生成配置文件
-                    self._append_log(f"更新配置文件失败，重新生成配置文件...\n", "warning")
-                    cf.write_basic_config(cfg, name, tid)
-                    self._append_log(f"已重新生成配置文件\n", "success")
-                    self.logger.info("已重新生成配置文件")
-        else:
-            # 配置文件不存在，生成新的配置文件
-            cf.write_basic_config(cfg, name, tid)
-            self._append_log(f"已生成默认配置文件\n", "info")
-            self.logger.info("已生成默认配置文件")
+        cfg = self._config_path_for(name)
 
-        normalized, changes = cf.normalize_local_service_protocols(cfg)
-        if normalized:
-            self._append_log("检测到本地服务协议与配置不一致，已自动修正:\n", "warning")
-            self.logger.warning("检测到本地服务协议与配置不一致，已尝试修正")
-            for detail in changes:
-                self._append_log(f"  · {detail}\n", "warning")
-                self.logger.warning(detail)
-
-        hostnames = self._extract_hostnames(cfg)
-        if not hostnames:
-            # 允许无 hostname 的配置运行，但提示用户手动配置路由
-            self._append_log("配置未设置 hostname，已跳过 DNS 路由检查，将按当前配置启动。\n", "warning")
-            self.logger.warning("配置缺少 hostname，跳过 DNS 路由检查")
-        else:
-            if not self._ensure_dns_routes(path, name, hostnames):
-                return
-
+        self._tunnel_operation_in_progress = True
+        self._manual_operation = True
+        if self.toggle_button:
+            try:
+                self.toggle_button.configure(state=tk.DISABLED)
+            except Exception:
+                pass
+        self.toggle_button_var.set("⏳ 启动中…")
+        self.status_var.set(f"启动中：{name}")
         self._append_log(f"正在启动隧道: {name}...\n", "info")
         self.logger.info(f"开始启动隧道: {name}")
 
-        if self._supervisor_active and self._supervisor_available:
-            self._append_log(f"请求守护进程启动隧道 {name}...\n", "info")
-            ok, msg = self.supervisor_client.start_tunnel(name)
-            if ok:
-                self._append_log(f"守护进程应答: {msg or '启动指令已发送'}\n", "success")
-                self.logger.info(f"守护进程启动 {name}: {msg}")
-            else:
-                self._append_log(f"守护进程启动失败: {msg}\n", "error")
-                self.logger.error(f"守护进程启动 {name} 失败: {msg}")
-                messagebox.showerror("守护进程启动失败", msg or "未知错误")
-            self._immediate_status_sync()
-            return
-
-        try:
-            persist_enabled = bool(self.persist_var.get())
-            capture_output = not persist_enabled
-            log_file = None
-            if persist_enabled:
-                log_dir = Path.cwd() / "logs" / "persistent"
-                log_dir.mkdir(parents=True, exist_ok=True)
-                log_file = log_dir / f"{name}.log"
-
-            cfg_protocol = (cf.get_config_protocol(cfg) or "").lower() or None
-            protocol_candidates: list[tuple[str | None, str]] = []
-            protocol_candidates.append((cfg_protocol, cfg_protocol or "默认"))
-            if cfg_protocol != "http2":
-                protocol_candidates.append(("http2", "http2"))
-
-            def _wait_ready(proc: subprocess.Popen, label: str) -> tuple[bool, str]:
-                last_detail = ""
-                for i in range(12):
-                    time.sleep(1)
-                    if proc.poll() is not None:
-                        return False, f"cloudflared 进程异常退出，返回码 {proc.returncode}"
-                    if i % 2 == 1:
-                        ok, detail = cf.test_connection(path, name, timeout=25)
-                        last_detail = detail
-                        if ok:
-                            return True, detail
-                return False, last_detail
-
-            started_proc: subprocess.Popen | None = None
-            used_protocol = protocol_candidates[0][1]
-            last_detail = ""
-
-            for idx, (proto, label) in enumerate(protocol_candidates):
-                proc = cf.run_tunnel(path, name, cfg, capture_output=capture_output, log_file=log_file, protocol=proto)
-                ok, detail = _wait_ready(proc, label)
-                if ok:
-                    started_proc = proc
-                    used_protocol = label
-                    break
-
-                last_detail = detail
-                cf.stop_process(proc)
-                if idx + 1 < len(protocol_candidates):
-                    self._append_log(
-                        f"协议 {label} 下未检测到活跃连接，尝试使用 http2 重新启动...\n",
-                        "warning",
-                    )
-                    self.logger.warning(f"协议 {label} 下未检测到活跃连接，正在回退 http2")
-
-            if not started_proc:
-                self.status_var.set("隧道启动失败")
-                self._append_log(
-                    f"隧道 {name} 启动失败：未检测到活跃连接。\n{last_detail or ''}\n",
-                    "error",
-                )
-                self.logger.error(f"隧道 {name} 启动失败，未检测到活跃连接：{last_detail}")
-                messagebox.showerror("启动失败", f"未检测到活跃连接，隧道启动失败。\n{last_detail}")
-                return
-
-            self.proc = started_proc
-            self.status_var.set(f"隧道 {name} 已激活")
-            self._append_log(f"隧道 {name} 已启动并激活（协议 {used_protocol}）\n", "success")
-            self.logger.info(f"隧道 {name} 已成功启动并激活，协议 {used_protocol}")
-
-            self.proc_map[name] = self.proc
-            mode = "persist" if persist_enabled else "interactive"
-            self.proc_tracker.register(
-                name,
-                self.proc.pid,
-                manager="modern_gui",
-                mode=mode,
-                metadata={"source": "gui", "protocol": used_protocol},
-            )
-
-            # 将隧道添加到激活列表
-            self.running_tunnels[name] = {
-                "name": name,
-                "pid": self.proc.pid,
-                "healthy": True,
+        def _worker() -> dict:
+            payload: dict = {
+                "mode": "direct",
+                "ok": False,
+                "tunnel_name": name,
+                "messages": [],
+                "warnings": [],
             }
 
-            if self.settings.get("tunnel.save_last_selected", True):
-                self.settings.set("tunnel.last_selected", name)
-            if self.autostart_var.get():
-                self._set_autostart_target(name)
+            if self._supervisor_active and self._supervisor_available:
+                ok, msg = self.supervisor_client.start_tunnel(name)
+                payload.update({"mode": "supervisor", "ok": ok, "message": msg})
+                return payload
 
-            # 启动日志读取线程（仅在捕获输出时）
-            if capture_output:
-                self.proc_thread = threading.Thread(target=self._read_proc_output, daemon=True)
-                self.proc_thread.start()
+            # 启动前清理同名残留进程，避免端口/metrics 占用（不影响 UI 线程）
+            try:
+                cleaned, msg = cf.kill_tunnel_by_name(name)
+                if cleaned:
+                    try:
+                        self.proc_tracker.unregister(name)
+                    except Exception:
+                        pass
+                    payload["messages"].append(f"启动前清理残留隧道: {msg}")
+            except Exception as exc:
+                payload["warnings"].append(f"清理残留隧道异常: {exc}")
+
+            # 确保配置文件存在且 UUID 正确
+            try:
+                if cfg.exists():
+                    if not cf.validate_tunnel_config(cfg, tid):
+                        payload["warnings"].append("检测到配置文件UUID不匹配，正在更新...")
+                        if cf.update_config_tunnel_id(cfg, tid):
+                            payload["messages"].append(f"配置文件UUID已更新为: {tid}")
+                        else:
+                            payload["warnings"].append("更新配置文件失败，重新生成配置文件...")
+                            cf.write_basic_config(cfg, name, tid)
+                            payload["messages"].append("已重新生成配置文件")
+                else:
+                    cf.write_basic_config(cfg, name, tid)
+                    payload["messages"].append("已生成默认配置文件")
+            except Exception as exc:
+                payload.update({"ok": False, "stage": "config", "error": str(exc)})
+                return payload
+
+            # 自动修正本地服务协议（可能探测端口，放到后台执行）
+            try:
+                normalized, changes = cf.normalize_local_service_protocols(cfg)
+            except Exception:
+                normalized, changes = False, []
+
+            if normalized:
+                payload["warnings"].append("检测到本地服务协议与配置不一致，已自动修正:")
+                for detail in changes:
+                    payload["warnings"].append(f"  · {detail}")
+
+            hostnames = self._extract_hostnames(cfg)
+            payload["hostnames"] = hostnames
+
+            # DNS 路由检查
+            if hostnames:
+                for hostname in hostnames:
+                    ok, out = cf.route_dns(path, name, hostname)
+                    if ok:
+                        payload["messages"].append(f"DNS 路由已配置: {hostname}")
+                        continue
+                    if "already exists" in out:
+                        payload["warnings"].append(f"DNS 记录已存在: {hostname}")
+                        continue
+                    payload.update({"ok": False, "stage": "dns", "hostname": hostname, "error": out})
+                    return payload
             else:
-                self.proc_thread = None
-                if log_file:
-                    self._append_log(f"持久化模式：cloudflared 输出写入 {log_file}\n", "info")
-                    self.logger.info(f"持久化日志写入 {log_file}")
+                payload["warnings"].append("配置未设置 hostname，已跳过 DNS 路由检查，将按当前配置启动。")
 
-            # 立即同步激活状态（无闪烁）
-            self._last_status_state = None  # 强制下次更新
-            self._immediate_status_sync()
-        except Exception as e:
-            self._append_log(f"启动失败: {e}\n", "error")
-            self.logger.error(f"启动隧道失败: {e}")
-            messagebox.showerror("启动失败", str(e))
-            self.proc = None
-            self._update_toggle_button_state()
+            # 启动并等待健康检查
+            launch = self._launch_tunnel_worker(path, name, cfg, capture_output, log_file)
+            payload["launch"] = launch
+            payload["ok"] = bool(launch.get("ok"))
+            return payload
+
+        def _finish(result: dict):
+            self._manual_operation = False
+            try:
+                for msg in result.get("messages", []) or []:
+                    self._append_log(msg + "\n", "info")
+                    self.logger.info(msg)
+                for msg in result.get("warnings", []) or []:
+                    self._append_log(msg + "\n", "warning")
+                    self.logger.warning(msg)
+
+                if result.get("mode") == "supervisor":
+                    ok = bool(result.get("ok"))
+                    msg = result.get("message") or ""
+                    if ok:
+                        self._append_log(f"守护进程应答: {msg or '启动指令已发送'}\n", "success")
+                        self.logger.info(f"守护进程启动 {name}: {msg}")
+                        self.status_var.set("启动指令已发送")
+                        self._refresh_proc_state()
+                        self._immediate_status_sync()
+                        return
+                    self._append_log(f"守护进程启动失败: {msg}\n", "error")
+                    self.logger.error(f"守护进程启动 {name} 失败: {msg}")
+                    messagebox.showerror("守护进程启动失败", msg or "未知错误")
+                    return
+
+                if not result.get("ok"):
+                    stage = result.get("stage") or "launch"
+                    err = result.get("error") or (result.get("launch") or {}).get("error") or "未知错误"
+                    if stage == "dns":
+                        hostname = result.get("hostname") or ""
+                        self.status_var.set("DNS 路由失败")
+                        self._append_log(f"DNS 路由失败: {err}\n", "error")
+                        self.logger.error(f"DNS 路由失败: {hostname} - {err}")
+                        messagebox.showerror("DNS 路由失败", f"{hostname} 配置失败：\n{err}")
+                        return
+                    if stage == "config":
+                        self.status_var.set("启动失败")
+                        self._append_log(f"配置处理失败: {err}\n", "error")
+                        self.logger.error(f"配置处理失败: {err}")
+                        messagebox.showerror("启动失败", f"配置处理失败：\n{err}")
+                        return
+
+                    self.status_var.set("隧道启动失败")
+                    self._append_log(f"隧道 {name} 启动失败：{err}\n", "error")
+                    self.logger.error(f"隧道 {name} 启动失败：{err}")
+                    messagebox.showerror("启动失败", f"未检测到活跃连接，隧道启动失败。\n{err}")
+                    return
+
+                launch = result.get("launch") or {}
+                proc = launch.get("proc")
+                protocol = launch.get("protocol", "默认")
+                detail = launch.get("detail", "")
+
+                if not proc:
+                    self.status_var.set("隧道启动失败")
+                    self._append_log(f"隧道 {name} 启动失败：未获得进程句柄\n", "error")
+                    self.logger.error(f"隧道 {name} 启动失败：未获得进程句柄")
+                    return
+
+                self.proc = proc
+                self.proc_map[name] = proc
+                self.running_tunnels[name] = {"name": name, "pid": proc.pid, "healthy": True}
+
+                self.status_var.set(f"隧道 {name} 已激活")
+                self._append_log(f"隧道 {name} 已启动并激活（协议 {protocol}）\n", "success")
+                self.logger.info(f"隧道 {name} 已成功启动并激活，协议 {protocol}")
+                if detail:
+                    self._append_log(f"{detail}\n", "info")
+
+                mode = "persist" if not capture_output else "interactive"
+                try:
+                    self.proc_tracker.register(
+                        name,
+                        proc.pid,
+                        manager="modern_gui",
+                        mode=mode,
+                        metadata={
+                            "source": "gui",
+                            "protocol": protocol,
+                            "log_file": str(log_file) if log_file else "",
+                        },
+                    )
+                except Exception:
+                    pass
+
+                if self.settings.get("tunnel.save_last_selected", True):
+                    self.settings.set("tunnel.last_selected", name)
+                if self.autostart_var.get():
+                    self._set_autostart_target(name)
+
+                if capture_output:
+                    self.proc_thread = threading.Thread(target=self._read_proc_output, daemon=True)
+                    self.proc_thread.start()
+                else:
+                    self.proc_thread = None
+                    if log_file:
+                        self._append_log(f"持久化模式：cloudflared 输出写入 {log_file}\n", "info")
+                        self.logger.info(f"持久化日志写入 {log_file}")
+
+                self._last_status_state = None
+                self._immediate_status_sync()
+            finally:
+                self._unlock_tunnel_operation()
+
+        def _thread_entry():
+            try:
+                result = _worker()
+            except Exception as exc:
+                result = {"ok": False, "stage": "exception", "error": str(exc)}
+            try:
+                self.after(0, lambda r=result: _finish(r))
+            except Exception:
+                # 视为窗口已关闭
+                pass
+
+        threading.Thread(target=_thread_entry, daemon=True).start()
 
     def _cleanup_residual_tunnel(self, tunnel_name: str):
         """在启动前清理同名残留进程，防止端口/metrics 冲突"""
@@ -2590,8 +2714,10 @@ class ModernTunnelManager(tk.Tk):
             self.logger.warning(f"清理残留隧道异常: {exc}")
 
     def _stop_running(self):
-        """停止运行中的隧道"""
-        # 获取当前选中的隧道
+        """停止运行中的隧道（后台执行，避免阻塞UI）"""
+        if self._tunnel_operation_in_progress:
+            return
+
         selected = self.tunnel_list.get_selected()
         if not selected:
             messagebox.showinfo("提示", "请先选择要停止的隧道")
@@ -2602,60 +2728,106 @@ class ModernTunnelManager(tk.Tk):
         if not self._can_control_tunnel(tunnel_name):
             return
 
-        # 检查隧道是否在运行
         if not self._is_tunnel_running(tunnel_name):
             messagebox.showinfo("提示", f"隧道 {tunnel_name} 未在运行")
             return
 
+        self._tunnel_operation_in_progress = True
+        self._manual_operation = True
+        if self.toggle_button:
+            try:
+                self.toggle_button.configure(state=tk.DISABLED)
+            except Exception:
+                pass
+        self.toggle_button_var.set("⏳ 停止中…")
+        self.status_var.set(f"停止中：{tunnel_name}")
         self._append_log(f"正在停止隧道 {tunnel_name}...\n", "warning")
         self.logger.warning(f"正在停止隧道 {tunnel_name}")
 
-        if self._supervisor_active and self._supervisor_available:
-            ok, msg = self.supervisor_client.stop_tunnel(tunnel_name)
-            if ok:
-                self._append_log(f"守护进程已执行停止指令: {msg}\n", "success")
-                self.logger.info(f"守护进程停止 {tunnel_name}: {msg}")
-            else:
-                self._append_log(f"守护进程停止失败: {msg}\n", "error")
-                self.logger.error(f"守护进程停止 {tunnel_name} 失败: {msg}")
-                messagebox.showerror("停止失败", msg or "守护进程拒绝操作")
-                return
-        else:
-            proc = self.proc_map.get(tunnel_name)
-            if proc and proc.poll() is None:
-                cf.stop_process(proc)
+        proc = self.proc_map.get(tunnel_name)
+
+        def _worker() -> dict:
+            if self._supervisor_active and self._supervisor_available:
+                ok, msg = self.supervisor_client.stop_tunnel(tunnel_name)
+                return {"mode": "supervisor", "ok": ok, "message": msg}
+
+            try:
+                if proc and proc.poll() is None:
+                    cf.stop_process(proc)
+                    try:
+                        self.proc_tracker.unregister(tunnel_name, expected_pid=proc.pid)
+                    except Exception:
+                        pass
+                    return {"mode": "direct", "ok": True, "method": "proc", "pid": proc.pid}
+
+                ok, msg = cf.kill_tunnel_by_name(tunnel_name)
+                if ok:
+                    try:
+                        self.proc_tracker.unregister(tunnel_name)
+                    except Exception:
+                        pass
+                return {"mode": "direct", "ok": ok, "method": "kill", "message": msg}
+            except Exception as exc:
+                return {"mode": "direct", "ok": False, "method": "exception", "error": str(exc)}
+
+        def _finish(result: dict):
+            self._manual_operation = False
+            try:
+                if result.get("mode") == "supervisor":
+                    ok = bool(result.get("ok"))
+                    msg = result.get("message") or ""
+                    if ok:
+                        self._append_log(f"守护进程已执行停止指令: {msg}\n", "success")
+                        self.logger.info(f"守护进程停止 {tunnel_name}: {msg}")
+                        self.status_var.set("停止指令已发送")
+                        # 先乐观更新 UI，后续由状态刷新校正
+                        self.running_tunnels.pop(tunnel_name, None)
+                        self._health_failures.pop(tunnel_name, None)
+                        self._auto_heal_pending.discard(tunnel_name)
+                        self._refresh_proc_state()
+                        self._immediate_status_sync()
+                        return
+                    self._append_log(f"守护进程停止失败: {msg}\n", "error")
+                    self.logger.error(f"守护进程停止 {tunnel_name} 失败: {msg}")
+                    messagebox.showerror("停止失败", msg or "守护进程拒绝操作")
+                    return
+
+                if not result.get("ok"):
+                    err = result.get("error") or result.get("message") or "停止失败"
+                    self._append_log(f"{err}\n", "error")
+                    self.logger.error(err)
+                    messagebox.showerror("停止失败", err)
+                    return
+
                 if proc is self.proc:
                     self.proc = None
                     self.proc_thread = None
                 self.proc_map.pop(tunnel_name, None)
-                self.proc_tracker.unregister(tunnel_name, expected_pid=proc.pid)
-            else:
-                # 如果是外部启动的，用新方法停止
-                ok, msg = cf.kill_tunnel_by_name(tunnel_name)
-                if ok:
-                    self._append_log(f"{msg}\n", "success")
-                    self.logger.info(msg)
-                    self.proc_map.pop(tunnel_name, None)
-                    self.proc_tracker.unregister(tunnel_name)
-                else:
-                    self._append_log(f"{msg}\n", "error")
-                    self.logger.error(msg)
-                    messagebox.showerror("停止失败", msg)
-                    return
 
-        self.status_var.set("隧道已停止")
-        self._append_log(f"隧道 {tunnel_name} 已停止并取消激活\n", "success")
-        self.logger.info(f"隧道 {tunnel_name} 已停止并取消激活")
+                self.status_var.set("隧道已停止")
+                self._append_log(f"隧道 {tunnel_name} 已停止并取消激活\n", "success")
+                self.logger.info(f"隧道 {tunnel_name} 已停止并取消激活")
 
-        # 立即从running_tunnels中移除，确保取消激活状态
-        if tunnel_name in self.running_tunnels:
-            del self.running_tunnels[tunnel_name]
-        self._health_failures.pop(tunnel_name, None)
-        self._auto_heal_pending.discard(tunnel_name)
+                self.running_tunnels.pop(tunnel_name, None)
+                self._health_failures.pop(tunnel_name, None)
+                self._auto_heal_pending.discard(tunnel_name)
 
-        # 立即同步取消激活状态（无闪烁）
-        self._last_status_state = None  # 强制下次更新
-        self._immediate_status_sync()
+                self._last_status_state = None
+                self._immediate_status_sync()
+            finally:
+                self._unlock_tunnel_operation()
+
+        def _thread_entry():
+            try:
+                result = _worker()
+            except Exception as exc:
+                result = {"mode": "direct", "ok": False, "method": "exception", "error": str(exc)}
+            try:
+                self.after(0, lambda r=result: _finish(r))
+            except Exception:
+                pass
+
+        threading.Thread(target=_thread_entry, daemon=True).start()
 
     def _test_tunnel(self):
         """测试隧道（内置诊断）"""
@@ -2848,7 +3020,7 @@ class ModernTunnelManager(tk.Tk):
 
     def _open_config_dir(self):
         """打开配置目录"""
-        config_dir = Path.cwd() / "tunnels"
+        config_dir = get_tunnels_dir()
         config_dir.mkdir(parents=True, exist_ok=True)
 
         try:
@@ -2862,17 +3034,56 @@ class ModernTunnelManager(tk.Tk):
         except Exception:
             messagebox.showinfo("配置目录", f"配置目录位置:\n{config_dir}")
 
-    def _append_log(self, text: str, tag: str = None):
+    def _append_log(self, text: str, tag: str | None = None, *, autoscroll: bool | None = None, trim: bool = True):
         """添加日志"""
-        self.log.insert(tk.END, f"[{datetime.now().strftime('%H:%M:%S')}] {text}")
+        if not hasattr(self, "log"):
+            return
+
+        show_timestamp = bool(self.settings.get("log.show_timestamp", True))
+        auto_scroll = bool(self.settings.get("log.auto_scroll", True)) if autoscroll is None else bool(autoscroll)
+
+        at_bottom = True
+        if auto_scroll:
+            try:
+                at_bottom = self.log.yview()[1] >= 0.99
+            except Exception:
+                at_bottom = True
+
+        prefix = f"[{datetime.now().strftime('%H:%M:%S')}] " if show_timestamp else ""
+        start = self.log.index(tk.END)
+        self.log.insert(tk.END, f"{prefix}{text}")
+        end = self.log.index(tk.END)
 
         if tag:
-            # 获取最后一行的索引
-            last_line = self.log.index("end-2c linestart")
-            end = self.log.index("end-1c")
-            self.log.tag_add(tag, last_line, end)
+            self.log.tag_add(tag, start, end)
 
-        self.log.see(tk.END)
+        if trim:
+            self._trim_log_widget()
+
+        if auto_scroll and at_bottom:
+            self.log.see(tk.END)
+
+    def _trim_log_widget(self):
+        """限制日志窗口行数，防止 Text 组件越来越慢"""
+        if not hasattr(self, "log"):
+            return
+        max_lines = int(self.settings.get("log.max_lines", 1000) or 1000)
+        if max_lines <= 0:
+            return
+        try:
+            line_count = int(str(self.log.index("end-1c")).split(".", 1)[0])
+        except Exception:
+            return
+
+        trim_margin = max(100, max_lines // 10)
+        if line_count <= max_lines + trim_margin:
+            return
+
+        delete_to = max(1, line_count - max_lines)
+        try:
+            self.log.delete("1.0", f"{delete_to}.0")
+        except Exception:
+            pass
 
     def _clear_log(self):
         """清空日志内容"""
@@ -2925,32 +3136,30 @@ class ModernTunnelManager(tk.Tk):
         if self._tunnel_operation_in_progress:
             return
 
-        try:
-            self._tunnel_operation_in_progress = True
+        # 获取当前选中的隧道
+        selected = self.tunnel_list.get_selected()
+        if not selected:
+            return
 
-            # 获取当前选中的隧道
-            selected = self.tunnel_list.get_selected()
-            if not selected:
-                return
+        tunnel_name = selected.get("name")
+        if not tunnel_name:
+            return
 
-            tunnel_name = selected.get("name")
-            if not tunnel_name:
-                return
-
-            # 检查该隧道是否在运行
-            if self._is_tunnel_running(tunnel_name):
-                self._stop_running()
-            else:
-                self._start_selected()
-        except Exception:
-            pass
-        finally:
-            # 延迟解锁，防止快速连续点击
-            self.after(1000, self._unlock_tunnel_operation)
+        # 检查该隧道是否在运行
+        if self._is_tunnel_running(tunnel_name):
+            self._stop_running()
+        else:
+            self._start_selected()
 
     def _unlock_tunnel_operation(self):
         """解锁隧道操作"""
         self._tunnel_operation_in_progress = False
+        if self.toggle_button:
+            try:
+                self.toggle_button.configure(state=tk.NORMAL)
+            except Exception:
+                pass
+        self._update_toggle_button_state()
 
     def _read_proc_output(self):
         """读取进程输出"""
@@ -2966,30 +3175,57 @@ class ModernTunnelManager(tk.Tk):
             pass
 
     def _drain_proc_queue(self):
-        """处理进程输出队列"""
-        drained = False
-        while not self.proc_queue.empty():
+        """处理进程输出/日志队列（节流，避免 UI 卡顿）"""
+        max_items = int(self.settings.get("log.drain_batch", 200) or 200)
+        auto_scroll = bool(self.settings.get("log.auto_scroll", True))
+        at_bottom = True
+        if auto_scroll and hasattr(self, "log"):
             try:
-                line = self.proc_queue.get_nowait()
-                # 根据内容判断日志类型
-                if "error" in line.lower():
-                    tag = "error"
-                elif "success" in line.lower() or "connected" in line.lower():
-                    tag = "success"
-                elif "warning" in line.lower():
-                    tag = "warning"
-                else:
-                    tag = "info"
+                at_bottom = self.log.yview()[1] >= 0.99
+            except Exception:
+                at_bottom = True
 
-                self._append_log(line, tag)
-                drained = True
+        processed = 0
+        while processed < max_items:
+            try:
+                item = self.proc_queue.get_nowait()
             except queue.Empty:
                 break
 
-        if drained:
-            self.log.see(tk.END)
+            processed += 1
 
-        self.after(200, self._drain_proc_queue)
+            if isinstance(item, tuple) and item:
+                kind = item[0]
+                if kind == "logger" and len(item) >= 3:
+                    _, message, tag = item[:3]
+                    self._append_log(str(message), str(tag) if tag else None, autoscroll=False, trim=False)
+                    continue
+
+                item = " ".join(str(x) for x in item)
+
+            line = str(item)
+            lower = line.lower()
+            if "error" in lower:
+                tag = "error"
+            elif "success" in lower or "connected" in lower:
+                tag = "success"
+            elif "warning" in lower:
+                tag = "warning"
+            else:
+                tag = "info"
+
+            self._append_log(line, tag, autoscroll=False, trim=False)
+
+        if processed:
+            self._trim_log_widget()
+            if auto_scroll and at_bottom and hasattr(self, "log"):
+                try:
+                    self.log.see(tk.END)
+                except Exception:
+                    pass
+
+        delay = 50 if not self.proc_queue.empty() else 200
+        self.after(delay, self._drain_proc_queue)
 
 
 # ============= 主入口 =============

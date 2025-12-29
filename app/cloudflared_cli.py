@@ -1,4 +1,5 @@
 from __future__ import annotations
+import base64
 import json
 import re
 import os
@@ -108,7 +109,11 @@ def login(cloudflared_path: str) -> subprocess.Popen:
     return subprocess.Popen([binary, "login"], creationflags=creationflags)
 
 
-def list_tunnels(cloudflared_path: str, return_error: bool = False) -> list[dict] | tuple[list[dict], str | None]:
+def list_tunnels(
+    cloudflared_path: str,
+    return_error: bool = False,
+    timeout: int = 15,
+) -> list[dict] | tuple[list[dict], str | None]:
     """
     列出 Cloudflare 隧道。
 
@@ -122,10 +127,15 @@ def list_tunnels(cloudflared_path: str, return_error: bool = False) -> list[dict
             text=True,
             encoding="utf-8",
             stderr=subprocess.PIPE,
+            timeout=timeout,
         )
         data = json.loads(out)
         result = data if isinstance(data, list) else []
         return (result, None) if return_error else result
+    except subprocess.TimeoutExpired:
+        error_msg = f"cloudflared tunnel list 超时（{timeout}s）"
+        result: list[dict] = []
+        return (result, error_msg) if return_error else result
     except Exception as exc:
         if isinstance(exc, subprocess.CalledProcessError):
             error_msg = (exc.stderr or exc.output or "").strip() or str(exc)
@@ -138,6 +148,7 @@ def list_tunnels(cloudflared_path: str, return_error: bool = False) -> list[dict
                 text=True,
                 encoding="utf-8",
                 stderr=subprocess.PIPE,
+                timeout=timeout,
             )
             lines = [l for l in out.splitlines() if l.strip()]
             if not lines:
@@ -354,6 +365,17 @@ def _macos_arch_slug() -> str:
     raise RuntimeError(f"暂不支持当前架构: {machine or 'unknown'}")
 
 
+def _windows_arch_slug() -> str:
+    machine = (platform.machine() or "").lower()
+    if machine in ("x86_64", "amd64"):
+        return "amd64"
+    if machine in ("i386", "i686", "x86"):
+        return "386"
+    if machine in ("aarch64", "arm64"):
+        return "arm64"
+    raise RuntimeError(f"暂不支持当前架构: {machine or 'unknown'}")
+
+
 def _latest_linux_download_url(arch_slug: str) -> tuple[str, Optional[str]]:
     api_url = "https://api.github.com/repos/cloudflare/cloudflared/releases/latest"
     headers = {
@@ -400,6 +422,32 @@ def _latest_macos_download_url(arch_slug: str) -> tuple[str, Optional[str]]:
     return fallback, None
 
 
+def _latest_windows_download_url(arch_slug: str) -> tuple[str, Optional[str]]:
+    api_url = "https://api.github.com/repos/cloudflare/cloudflared/releases/latest"
+    headers = {
+        "User-Agent": "cloudflared-gui",
+        "Accept": "application/vnd.github+json",
+    }
+    try:
+        req = urllib.request.Request(api_url, headers=headers)
+        with urllib.request.urlopen(req, timeout=10) as resp:
+            data = json.loads(resp.read().decode("utf-8"))
+        assets = data.get("assets") or []
+        target_name = f"cloudflared-windows-{arch_slug}.exe"
+        for asset in assets:
+            name = asset.get("name", "")
+            download_url = asset.get("browser_download_url")
+            if name == target_name and download_url:
+                return download_url, data.get("tag_name")
+    except Exception:
+        pass
+    fallback = (
+        "https://github.com/cloudflare/cloudflared/releases/latest/download/"
+        f"cloudflared-windows-{arch_slug}.exe"
+    )
+    return fallback, None
+
+
 def _download_file(url: str, destination: Path, progress_cb: Callable[[int], None] | None = None) -> None:
     req = urllib.request.Request(url, headers={"User-Agent": "cloudflared-gui"})
     with urllib.request.urlopen(req, timeout=30) as resp, open(destination, "wb") as f:
@@ -417,6 +465,18 @@ def _download_file(url: str, destination: Path, progress_cb: Callable[[int], Non
                 progress_cb(min(pct, 100))
 
 
+def download_cloudflared(
+    target_path: Path | None = None,
+    progress_cb: Callable[[int], None] | None = None,
+) -> tuple[bool, str, Optional[str]]:
+    """下载适用于当前系统的 cloudflared。"""
+    if _is_windows():
+        return _download_cloudflared_windows(target_path, progress_cb)
+    if _is_macos():
+        return _download_cloudflared_macos(target_path, progress_cb)
+    return _download_cloudflared_linux(target_path, progress_cb)
+
+
 def download_cloudflared_linux(target_path: Path | None = None,
                                progress_cb: Callable[[int], None] | None = None) -> tuple[bool, str, Optional[str]]:
     """下载适用于当前 Linux/macOS 的 cloudflared，并赋予执行权限。"""
@@ -429,6 +489,36 @@ def download_cloudflared_linux(target_path: Path | None = None,
     return _download_cloudflared_linux(target_path, progress_cb)
 
 
+def _download_cloudflared_windows(
+    target_path: Path | None,
+    progress_cb: Callable[[int], None] | None,
+) -> tuple[bool, str, Optional[str]]:
+    try:
+        arch_slug = _windows_arch_slug()
+    except RuntimeError as e:
+        return False, str(e), None
+
+    url, version = _latest_windows_download_url(arch_slug)
+    base_dir = Path(__file__).resolve().parent.parent
+    target = Path(target_path) if target_path else (base_dir / "cloudflared.exe")
+    target.parent.mkdir(parents=True, exist_ok=True)
+    tmp_path = Path(f"{target}.tmp")
+
+    try:
+        _download_file(url, tmp_path, progress_cb)
+        tmp_path.replace(target)
+        message = f"cloudflared (windows-{arch_slug}) 已更新到 {target}"
+        return True, message, version
+    except urllib.error.URLError as e:
+        if tmp_path.exists():
+            tmp_path.unlink(missing_ok=True)
+        return False, f"下载失败: {e}", version
+    except Exception as e:
+        if tmp_path.exists():
+            tmp_path.unlink(missing_ok=True)
+        return False, f"更新失败: {e}", version
+
+
 def _download_cloudflared_linux(target_path: Path | None,
                                 progress_cb: Callable[[int], None] | None) -> tuple[bool, str, Optional[str]]:
     try:
@@ -437,7 +527,8 @@ def _download_cloudflared_linux(target_path: Path | None,
         return False, str(e), None
 
     url, version = _latest_linux_download_url(arch_slug)
-    target = Path(target_path) if target_path else Path.cwd() / "cloudflared"
+    base_dir = Path(__file__).resolve().parent.parent
+    target = Path(target_path) if target_path else (base_dir / "cloudflared")
     target.parent.mkdir(parents=True, exist_ok=True)
     tmp_path = Path(f"{target}.tmp")
 
@@ -465,7 +556,8 @@ def _download_cloudflared_macos(target_path: Path | None,
         return False, str(e), None
 
     url, version = _latest_macos_download_url(arch_slug)
-    target = Path(target_path) if target_path else Path.cwd() / "cloudflared"
+    base_dir = Path(__file__).resolve().parent.parent
+    target = Path(target_path) if target_path else (base_dir / "cloudflared")
     target.parent.mkdir(parents=True, exist_ok=True)
     archive_tmp = Path(f"{target}.tgz.tmp")
     binary_tmp = Path(f"{target}.tmp")
@@ -612,8 +704,13 @@ def normalize_local_service_protocols(config_path: Path) -> tuple[bool, list[str
     return True, changes
 
 
-def _create_popen(cmd: list[str], workdir: Path | None = None, capture_output: bool = True,
-                  log_file: Path | None = None) -> subprocess.Popen:
+def _create_popen(
+    cmd: list[str],
+    workdir: Path | None = None,
+    capture_output: bool = True,
+    log_file: Path | None = None,
+    env: dict[str, str] | None = None,
+) -> subprocess.Popen:
     creationflags = 0x08000000 if _is_windows() else 0
     preexec_fn = None if _is_windows() else os.setsid
     stdout = subprocess.PIPE if capture_output else subprocess.DEVNULL
@@ -633,6 +730,7 @@ def _create_popen(cmd: list[str], workdir: Path | None = None, capture_output: b
         stderr=stderr,
         text=True,
         encoding="utf-8",
+        env=env,
         creationflags=creationflags,
         preexec_fn=preexec_fn,
     )
@@ -642,6 +740,152 @@ def _create_popen(cmd: list[str], workdir: Path | None = None, capture_output: b
         except Exception:
             pass
     return proc
+
+
+def extract_credentials_file_from_config(config_path: Path) -> str | None:
+    """从配置文件中提取 credentials-file 字段"""
+    if not config_path.exists():
+        return None
+
+    try:
+        import yaml
+        data = yaml.safe_load(config_path.read_text(encoding="utf-8")) or {}
+        cred = data.get("credentials-file")
+        if isinstance(cred, str) and cred.strip():
+            return cred.strip()
+    except Exception:
+        try:
+            for line in config_path.read_text(encoding="utf-8").splitlines():
+                raw = line.strip()
+                if raw.startswith("credentials-file:"):
+                    value = raw.split(":", 1)[1].strip().strip("\"'").strip()
+                    return value or None
+        except Exception:
+            return None
+    return None
+
+
+def resolve_credentials_path(config_path: Path) -> Path | None:
+    """将配置文件里的 credentials-file 解析为本机 Path（相对路径按 config 同目录）"""
+    cred = extract_credentials_file_from_config(config_path)
+    if not cred:
+        return None
+    path = Path(cred).expanduser()
+    if not path.is_absolute():
+        path = (config_path.parent / path)
+    return path
+
+
+class TunnelCredentialsError(RuntimeError):
+    """Raised when tunnel credentials/token cannot be obtained for running a tunnel."""
+
+
+def tunnel_token(cloudflared_path: str, tunnel_name: str, timeout: int = 20) -> str:
+    """获取 tunnel token（不会在异常信息中泄露 token）"""
+    binary = _ensure_binary(cloudflared_path)
+    try:
+        out = subprocess.check_output(
+            [binary, "tunnel", "token", tunnel_name],
+            stderr=subprocess.STDOUT,
+            text=True,
+            encoding="utf-8",
+            timeout=timeout,
+        )
+        token = (out or "").strip()
+        if not token:
+            raise TunnelCredentialsError("获取隧道 token 失败：cloudflared 返回空输出")
+        return token
+    except subprocess.TimeoutExpired as exc:
+        raise TunnelCredentialsError("获取隧道 token 超时，请检查网络或稍后重试") from exc
+    except subprocess.CalledProcessError as exc:
+        msg = (exc.output or "").strip()
+        raise TunnelCredentialsError(f"获取隧道 token 失败：{msg or 'cloudflared 返回非零退出码'}") from None
+
+
+def _credentials_from_token(token: str) -> dict[str, str]:
+    token = (token or "").strip()
+    if not token:
+        raise TunnelCredentialsError("解析隧道 token 失败：token 为空")
+
+    try:
+        padded = token + ("=" * (-len(token) % 4))
+        payload_raw = base64.b64decode(padded.encode("utf-8"))
+        payload = json.loads(payload_raw.decode("utf-8"))
+    except Exception:
+        raise TunnelCredentialsError("解析隧道 token 失败：token 格式异常") from None
+
+    if not isinstance(payload, dict):
+        raise TunnelCredentialsError("解析隧道 token 失败：token 内容异常")
+
+    account_tag = payload.get("a")
+    tunnel_secret = payload.get("s")
+    tunnel_id = payload.get("t")
+    if not (isinstance(account_tag, str) and isinstance(tunnel_secret, str) and isinstance(tunnel_id, str)):
+        raise TunnelCredentialsError("解析隧道 token 失败：token 内容缺少必要字段")
+    if not (account_tag.strip() and tunnel_secret.strip() and tunnel_id.strip()):
+        raise TunnelCredentialsError("解析隧道 token 失败：token 内容为空")
+
+    return {
+        "AccountTag": account_tag.strip(),
+        "TunnelSecret": tunnel_secret.strip(),
+        "TunnelID": tunnel_id.strip(),
+    }
+
+
+def write_credentials_file(credentials_path: Path, credentials: dict[str, str]) -> None:
+    """写入 cloudflared tunnel credentials 文件（JSON，utf-8 无 BOM）"""
+    credentials_path.parent.mkdir(parents=True, exist_ok=True)
+    tmp_path = credentials_path.with_suffix(credentials_path.suffix + ".tmp")
+    try:
+        tmp_path.write_text(json.dumps(credentials, ensure_ascii=False), encoding="utf-8")
+        tmp_path.replace(credentials_path)
+        if not _is_windows():
+            try:
+                os.chmod(credentials_path, 0o600)
+            except Exception:
+                pass
+    finally:
+        tmp_path.unlink(missing_ok=True)
+
+
+def update_config_credentials_file(config_path: Path, credentials_path: Path) -> bool:
+    """更新配置文件中的 credentials-file 路径（尽量保持原格式，仅替换对应行）"""
+    if not config_path.exists():
+        return False
+
+    new_value = str(credentials_path)
+    try:
+        lines = config_path.read_text(encoding="utf-8").splitlines()
+    except Exception:
+        return False
+
+    updated: list[str] = []
+    replaced = False
+    for line in lines:
+        stripped = line.lstrip()
+        if stripped.startswith("credentials-file:"):
+            indent = line[: len(line) - len(stripped)]
+            updated.append(f"{indent}credentials-file: {new_value}")
+            replaced = True
+        else:
+            updated.append(line)
+
+    if not replaced:
+        inserted: list[str] = []
+        done = False
+        for line in updated:
+            inserted.append(line)
+            if not done and line.lstrip().startswith("tunnel:"):
+                indent = line[: len(line) - len(line.lstrip())]
+                inserted.append(f"{indent}credentials-file: {new_value}")
+                done = True
+        updated = inserted if done else updated
+
+    try:
+        config_path.write_text("\n".join(updated) + "\n", encoding="utf-8")
+        return True
+    except Exception:
+        return False
 
 
 def get_config_protocol(config_path: Path) -> str | None:
@@ -663,11 +907,52 @@ def run_tunnel(cloudflared_path: str, name: str, config_path: Path,
                capture_output: bool = True, log_file: Path | None = None,
                protocol: str | None = None) -> subprocess.Popen:
     binary = _ensure_binary(cloudflared_path)
+
+    env: dict[str, str] | None = None
+    credentials_override: Path | None = None
+
+    config_cred_path = resolve_credentials_path(config_path)
+    if config_cred_path and config_cred_path.is_file():
+        credentials_override = None  # 使用配置文件里的 credentials-file
+    else:
+        tunnel_id = extract_tunnel_id_from_config(config_path) or ""
+        default_cred = default_credentials_path(tunnel_id) if tunnel_id else None
+        if default_cred and default_cred.is_file():
+            credentials_override = default_cred
+        elif default_cred:
+            token = tunnel_token(cloudflared_path, name)
+            try:
+                creds = _credentials_from_token(token)
+                if creds.get("TunnelID") != tunnel_id:
+                    raise TunnelCredentialsError("获取隧道凭据失败：token 与配置中的 tunnel UUID 不一致")
+                write_credentials_file(default_cred, creds)
+                credentials_override = default_cred
+            except Exception:
+                # 兜底：无法落盘时仍尝试用 token 启动（但启动稳定性会依赖 Cloudflare API）
+                env = os.environ.copy()
+                env["TUNNEL_TOKEN"] = token
+        else:
+            token = tunnel_token(cloudflared_path, name)
+            env = os.environ.copy()
+            env["TUNNEL_TOKEN"] = token
+
+        if credentials_override and (not config_cred_path or config_cred_path != credentials_override):
+            update_config_credentials_file(config_path, credentials_override)
+
     cmd = [binary, "--config", str(config_path)]
     if protocol:
         cmd.extend(["--protocol", protocol])
-    cmd.extend(["tunnel", "run", name])
-    return _create_popen(cmd, workdir=config_path.parent, capture_output=capture_output, log_file=log_file)
+    cmd.extend(["tunnel", "run"])
+    if credentials_override:
+        cmd.extend(["--credentials-file", str(credentials_override)])
+    cmd.append(name)
+    return _create_popen(
+        cmd,
+        workdir=config_path.parent,
+        capture_output=capture_output,
+        log_file=log_file,
+        env=env,
+    )
 
 
 def stop_process(proc: subprocess.Popen, timeout: float = 5.0) -> None:
@@ -787,82 +1072,162 @@ def update_config_tunnel_id(config_path: Path, new_tunnel_id: str) -> bool:
             return False
 
 
+def _extract_tunnel_name_from_cmdline(cmdline: str) -> str | None:
+    if not cmdline:
+        return None
+    match = re.search(r"(?:^|\s)tunnel\s+run\s+([^\s]+)", cmdline)
+    if not match:
+        return None
+    name = match.group(1).strip().strip("\"'").strip()
+    return name or None
+
+
+def _windows_cloudflared_processes() -> list[tuple[int, str]]:
+    import csv
+    import io
+
+    if shutil.which("wmic"):
+        try:
+            cmd = [
+                "wmic",
+                "process",
+                "where",
+                'name="cloudflared.exe"',
+                "get",
+                "ProcessId,CommandLine",
+                "/format:csv",
+            ]
+            result = subprocess.run(
+                cmd,
+                capture_output=True,
+                text=True,
+                encoding="utf-8",
+                errors="ignore",
+                check=False,
+            )
+            rows = list(csv.DictReader(io.StringIO(result.stdout or "")))
+            processes: list[tuple[int, str]] = []
+            for row in rows:
+                pid_raw = (row.get("ProcessId") or row.get("ProcessID") or "").strip()
+                cmdline = (row.get("CommandLine") or "").strip()
+                if pid_raw.isdigit():
+                    processes.append((int(pid_raw), cmdline))
+            if processes:
+                return processes
+        except Exception:
+            pass
+
+    if shutil.which("powershell"):
+        try:
+            ps_script = (
+                "[Console]::OutputEncoding = [System.Text.Encoding]::UTF8; "
+                "$items = Get-CimInstance Win32_Process -Filter \"Name='cloudflared.exe'\" "
+                "| Select-Object ProcessId,CommandLine; "
+                "$items | ConvertTo-Json -Compress"
+            )
+            result = subprocess.run(
+                ["powershell", "-NoProfile", "-Command", ps_script],
+                capture_output=True,
+                text=True,
+                encoding="utf-8",
+                errors="ignore",
+                check=False,
+            )
+            raw = (result.stdout or "").strip().lstrip("\ufeff")
+            if not raw:
+                return []
+            data = json.loads(raw)
+            if not data:
+                return []
+            items = data if isinstance(data, list) else [data]
+            processes = []
+            for item in items:
+                if not isinstance(item, dict):
+                    continue
+                pid = item.get("ProcessId")
+                cmdline = item.get("CommandLine") or ""
+                try:
+                    pid_int = int(pid)
+                except Exception:
+                    continue
+                processes.append((pid_int, str(cmdline)))
+            return processes
+        except Exception:
+            return []
+
+    return []
+
+
+def _running_tunnels_from_tracker() -> list[dict]:
+    tracker_type = None
+    try:
+        from .utils.process_tracker import ProcessTracker as tracker_type  # type: ignore
+    except Exception:
+        try:
+            from utils.process_tracker import ProcessTracker as tracker_type  # type: ignore
+        except Exception:
+            tracker_type = None
+
+    if tracker_type is None:
+        return []
+
+    base_dir = Path(__file__).resolve().parent.parent
+    try:
+        tracker = tracker_type(base_dir)
+        running: list[dict] = []
+        for record in tracker.list_records():
+            if record.alive:
+                running.append({"pid": record.pid, "name": record.name})
+        return running
+    except Exception:
+        return []
+
+
 def find_running_tunnel(tunnel_name: str) -> dict | None:
     """检测指定隧道是否在系统中运行"""
-    import subprocess
-    import json
-
-    try:
-        # 使用ps命令查找cloudflared进程
-        if _is_windows():
-            # Windows使用wmic
-            cmd = ['wmic', 'process', 'where', f'name="cloudflared.exe"', 'get', 'processid,commandline', '/format:csv']
-            result = subprocess.run(cmd, capture_output=True, text=True, check=False)
-            lines = result.stdout.strip().split('\n')
-
-            for line in lines[2:]:  # 跳过头部
-                if tunnel_name in line and "tunnel run" in line:
-                    parts = line.split(',')
-                    if len(parts) >= 3:
-                        return {"pid": int(parts[2]), "name": tunnel_name}
-        else:
-            # Linux/Mac使用ps
-            result = subprocess.run(['ps', 'aux'], capture_output=True, text=True, check=False)
-
-            for line in result.stdout.split('\n'):
-                if 'cloudflared' in line and tunnel_name in line and 'tunnel run' in line:
-                    parts = line.split()
-                    if len(parts) > 1:
-                        return {"pid": int(parts[1]), "name": tunnel_name}
-    except Exception:
-        pass
-
+    for item in get_running_tunnels():
+        if item.get("name") == tunnel_name and str(item.get("pid", "")).isdigit():
+            return {"pid": int(item["pid"]), "name": tunnel_name}
     return None
 
 
 def get_running_tunnels() -> list[dict]:
-    """获取所有运行中的隧道信息"""
-    import subprocess
+    """获取所有运行中的隧道信息（跨平台）"""
+    running_tunnels: list[dict] = []
+    seen: set[tuple[int, str]] = set()
 
-    running_tunnels = []
+    def _add(pid: int, name: str):
+        key = (int(pid), name)
+        if key in seen:
+            return
+        seen.add(key)
+        running_tunnels.append({"pid": int(pid), "name": name})
+
+    for item in _running_tunnels_from_tracker():
+        pid = item.get("pid")
+        name = item.get("name")
+        if isinstance(name, str) and str(pid or "").isdigit():
+            _add(int(pid), name)
 
     try:
         if _is_windows():
-            cmd = ['wmic', 'process', 'where', 'name="cloudflared.exe"', 'get', 'processid,commandline', '/format:csv']
-            result = subprocess.run(cmd, capture_output=True, text=True, check=False)
-            lines = result.stdout.strip().split('\n')
+            for pid, cmdline in _windows_cloudflared_processes():
+                name = _extract_tunnel_name_from_cmdline(cmdline)
+                if name:
+                    _add(pid, name)
+            return running_tunnels
 
-            for line in lines[2:]:  # 跳过头部
-                if "tunnel run" in line:
-                    parts = line.split(',')
-                    if len(parts) >= 3:
-                        # 从命令行提取隧道名称
-                        cmd_parts = parts[1].split()
-                        for i, part in enumerate(cmd_parts):
-                            if part == "run" and i + 1 < len(cmd_parts):
-                                tunnel_name = cmd_parts[i + 1]
-                                running_tunnels.append({
-                                    "pid": int(parts[2]),
-                                    "name": tunnel_name
-                                })
-                                break
-        else:
-            # Linux/Mac使用ps
-            result = subprocess.run(['ps', 'aux'], capture_output=True, text=True, check=False)
-
-            for line in result.stdout.split('\n'):
-                if 'cloudflared' in line and 'tunnel run' in line:
-                    parts = line.split()
-                    if len(parts) > 1:
-                        # 从命令行提取隧道名称
-                        for i, part in enumerate(parts):
-                            if part == "run" and i + 1 < len(parts):
-                                tunnel_name = parts[i + 1]
-                                running_tunnels.append({
-                                    "pid": int(parts[1]),
-                                    "name": tunnel_name
-                                })
-                                break
+        result = subprocess.run(["ps", "aux"], capture_output=True, text=True, check=False)
+        for line in (result.stdout or "").splitlines():
+            if "cloudflared" not in line:
+                continue
+            name = _extract_tunnel_name_from_cmdline(line)
+            if not name:
+                continue
+            parts = line.split()
+            if len(parts) < 2 or not parts[1].isdigit():
+                continue
+            _add(int(parts[1]), name)
     except Exception:
         pass
 
@@ -871,34 +1236,73 @@ def get_running_tunnels() -> list[dict]:
 
 def kill_tunnel_by_name(tunnel_name: str) -> tuple[bool, str]:
     """通过隧道名称停止运行的隧道"""
-    tunnel_info = find_running_tunnel(tunnel_name)
-
-    if not tunnel_info:
+    running = [t for t in get_running_tunnels() if t.get("name") == tunnel_name and t.get("pid")]
+    if not running:
         return False, f"隧道 {tunnel_name} 未在运行"
 
-    pid = tunnel_info["pid"]
+    pids = sorted({int(t["pid"]) for t in running if str(t.get("pid", "")).isdigit()})
+    if not pids:
+        return False, f"隧道 {tunnel_name} 未在运行"
+
+    def _pid_alive(pid: int) -> bool:
+        if not _is_windows():
+            try:
+                stat_path = Path(f"/proc/{pid}/stat")
+                if stat_path.exists():
+                    parts = stat_path.read_text(encoding="utf-8", errors="ignore").split()
+                    if len(parts) > 2 and parts[2].upper() == "Z":
+                        return False
+            except Exception:
+                pass
+        try:
+            os.kill(pid, 0)
+            return True
+        except ProcessLookupError:
+            return False
+        except Exception:
+            return True
+
+    errors: list[str] = []
 
     try:
-        import os
-        import signal
+        import time
 
         if _is_windows():
-            subprocess.run(['taskkill', '/PID', str(pid), '/F'], check=True)
-        else:
-            os.kill(pid, signal.SIGTERM)
-            # 给进程一些时间优雅退出
-            import time
-            time.sleep(1)
+            for pid in pids:
+                try:
+                    subprocess.run(['taskkill', '/PID', str(pid), '/F'], check=True)
+                except Exception as e:
+                    errors.append(f"PID {pid}: {e}")
+            ok = not errors
+            msg = f"已停止隧道 {tunnel_name} (PIDs: {', '.join(map(str, pids))})"
+            if errors:
+                msg += f"；失败: {', '.join(errors)}"
+            return ok, msg
 
-            # 检查进程是否还存在
+        for pid in pids:
             try:
-                os.kill(pid, 0)  # 仅检查，不发送信号
-                # 如果还存在，强制杀死
-                os.kill(pid, signal.SIGKILL)
-            except ProcessLookupError:
-                pass  # 进程已经退出
+                os.kill(pid, signal.SIGTERM)
+            except Exception as e:
+                errors.append(f"PID {pid}: {e}")
 
-        return True, f"已停止隧道 {tunnel_name} (PID: {pid})"
+        time.sleep(1)
+        still_alive = [pid for pid in pids if _pid_alive(pid)]
+        for pid in still_alive:
+            try:
+                os.kill(pid, signal.SIGKILL)
+            except Exception as e:
+                errors.append(f"PID {pid} SIGKILL: {e}")
+
+        time.sleep(0.5)
+        remaining = [pid for pid in pids if _pid_alive(pid)]
+        ok = not remaining
+        msg = f"已停止隧道 {tunnel_name} (PIDs: {', '.join(map(str, pids))})"
+        if remaining:
+            msg += f"；仍存活: {', '.join(map(str, remaining))}"
+        if errors:
+            msg += f"；错误: {', '.join(errors)}"
+        return ok, msg
+
     except Exception as e:
         return False, f"停止隧道失败: {e}"
 

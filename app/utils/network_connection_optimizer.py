@@ -13,6 +13,7 @@ import subprocess
 import time
 import sys
 import json
+import os
 from datetime import datetime, timedelta
 from pathlib import Path
 from typing import Optional, Tuple
@@ -247,17 +248,29 @@ class ImprovedTunnelMonitor:
         # 执行重启
         try:
             # 停止现有进程
-            subprocess.run(
-                ["pkill", "-f", f"tunnel.*run.*{self.tunnel_name}"],
-                timeout=10,
-            )
+            if os.name == "nt":
+                try:
+                    try:
+                        from .. import cloudflared_cli as cf  # type: ignore
+                    except Exception:
+                        import cloudflared_cli as cf  # type: ignore
+                    cf.kill_tunnel_by_name(self.tunnel_name)
+                except Exception:
+                    pass
+            else:
+                subprocess.run(
+                    ["pkill", "-f", f"tunnel.*run.*{self.tunnel_name}"],
+                    timeout=10,
+                )
             time.sleep(2)
 
             # 启动新进程
+            creationflags = 0x08000000 if os.name == "nt" else 0
             subprocess.Popen(
                 [self.cloudflared_path, "tunnel", "run", self.tunnel_name],
                 stdout=subprocess.DEVNULL,
                 stderr=subprocess.DEVNULL,
+                creationflags=creationflags,
             )
 
             self.last_restart_time = current_time

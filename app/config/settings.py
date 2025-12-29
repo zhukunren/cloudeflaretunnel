@@ -6,12 +6,21 @@ import json
 from pathlib import Path
 from typing import Any, Optional
 
+try:
+    from ..utils.paths import get_config_dir
+except Exception:
+    try:
+        from utils.paths import get_config_dir  # type: ignore
+    except Exception:
+        def get_config_dir() -> Path:  # type: ignore
+            return Path.cwd() / "config"
+
 
 class Settings:
     """应用设置管理器"""
 
     def __init__(self, config_file: Optional[Path] = None):
-        self.config_file = config_file or (Path.cwd() / "config" / "app_config.json")
+        self.config_file = config_file or (get_config_dir() / "app_config.json")
         self.config_file.parent.mkdir(parents=True, exist_ok=True)
         self._settings = self._load_settings()
 

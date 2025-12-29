@@ -3,6 +3,10 @@
 
 set -e
 
+SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
+REPO_ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
+cd "$REPO_ROOT"
+
 echo "================================"
 echo "Cloudflare Tunnel Manager 安装"
 echo "================================"
@@ -23,17 +27,18 @@ echo "✓ Python版本: $python_version"
 # 创建虚拟环境
 echo ""
 echo "2. 创建虚拟环境..."
-if [ -d "venv" ]; then
+VENV_DIR="${VENV_DIR:-.venv}"
+if [ -d "$VENV_DIR" ]; then
     echo "虚拟环境已存在,跳过创建"
 else
-    python3 -m venv venv
+    python3 -m venv "$VENV_DIR"
     echo "✓ 虚拟环境创建成功"
 fi
 
 # 激活虚拟环境
 echo ""
 echo "3. 激活虚拟环境..."
-source venv/bin/activate
+source "$VENV_DIR/bin/activate"
 echo "✓ 虚拟环境已激活"
 
 # 升级pip
@@ -45,7 +50,7 @@ echo "✓ pip 已升级"
 # 安装依赖
 echo ""
 echo "5. 安装依赖..."
-pip install -r requirements.txt
+pip install -r app/requirements.txt
 echo "✓ 依赖安装完成"
 
 # 检查cloudflared
@@ -53,8 +58,8 @@ echo ""
 echo "6. 检查cloudflared..."
 if command -v cloudflared &> /dev/null; then
     echo "✓ cloudflared 已安装: $(cloudflared --version | head -1)"
-elif [ -f "../cloudflared" ]; then
-    echo "✓ cloudflared 找到: ../cloudflared"
+elif [ -f "./cloudflared" ]; then
+    echo "✓ cloudflared 找到: ./cloudflared"
 else
     echo "⚠ cloudflared 未找到"
     echo "  选项1: 应用内点击'⬇'图标自动下载"
@@ -64,7 +69,7 @@ fi
 # 创建必要目录
 echo ""
 echo "7. 创建目录结构..."
-mkdir -p assets config logs tunnels
+mkdir -p config logs tunnels
 echo "✓ 目录创建完成"
 
 # 完成
@@ -78,6 +83,6 @@ echo "  python -m app.main          # 现代UI"
 echo "  python -m app.main --classic # 经典UI"
 echo ""
 echo "查看文档:"
-echo "  cat README.md               # 项目说明"
-echo "  cat USAGE.md                # 使用指南"
+echo "  cat README.md                   # 项目说明"
+echo "  cat docs/TROUBLESHOOTING.md     # 故障排查"
 echo ""

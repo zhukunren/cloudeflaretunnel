@@ -13,6 +13,14 @@ import json
 from datetime import datetime
 from pathlib import Path
 
+try:
+    from . import cloudflared_cli as cf  # type: ignore
+except Exception:
+    try:
+        import cloudflared_cli as cf  # type: ignore
+    except Exception:
+        cf = None  # type: ignore
+
 # 配置参数
 TUNNEL_NAME = "homepage"  # 默认隧道名称
 CHECK_INTERVAL = 60  # 检查间隔（秒）
@@ -44,9 +52,12 @@ def get_cloudflared_path() -> str:
             pass
 
     # 然后尝试项目根目录
-    local_path = PROJECT_ROOT / "cloudflared"
-    if local_path.exists():
-        return str(local_path)
+    candidates = [PROJECT_ROOT / "cloudflared"]
+    if os.name == "nt":
+        candidates.insert(0, PROJECT_ROOT / "cloudflared.exe")
+    for local_path in candidates:
+        if local_path.exists():
+            return str(local_path)
 
     # 最后使用系统 PATH 中的 cloudflared
     return "cloudflared"
@@ -156,6 +167,11 @@ def check_tunnel_status(tunnel_name: str) -> bool:
 
 def check_tunnel_connectivity(tunnel_name: str) -> bool:
     """检查隧道连通性（检查进程是否存在）"""
+    if cf:
+        try:
+            return any(t.get("name") == tunnel_name for t in cf.get_running_tunnels())
+        except Exception:
+            pass
     try:
         result = subprocess.run(
             ["pgrep", "-f", f"tunnel.*run.*{tunnel_name}"],
