@@ -14,7 +14,6 @@ import urllib.request
 import urllib.error
 import os
 import json
-import shutil
 import subprocess
 import time
 import traceback
@@ -26,7 +25,15 @@ from typing import Callable
 try:
     # 包模式导入
     from . import cloudflared_cli as cf
-    from .services import AuthService, DnsRouteService, TunnelDiagnosticsService, TunnelLifecycleService
+    from .services import (
+        AuthService,
+        DnsRouteService,
+        TunnelCatalogLoadResult,
+        TunnelCatalogService,
+        TunnelConfigService,
+        TunnelDiagnosticsService,
+        TunnelLifecycleService,
+    )
     from .utils.theme import Theme
     from .components.widgets import ModernButton, IconButton, Card, Badge, StatusIndicator, SearchBox
     from .config.settings import Settings
@@ -39,7 +46,15 @@ except (ImportError, ValueError):
     import sys
     sys.path.append(os.path.dirname(__file__))
     import cloudflared_cli as cf
-    from services import AuthService, DnsRouteService, TunnelDiagnosticsService, TunnelLifecycleService
+    from services import (
+        AuthService,
+        DnsRouteService,
+        TunnelCatalogLoadResult,
+        TunnelCatalogService,
+        TunnelConfigService,
+        TunnelDiagnosticsService,
+        TunnelLifecycleService,
+    )
     from utils.theme import Theme
     from components.widgets import ModernButton, IconButton, Card, Badge, StatusIndicator, SearchBox
     from config.settings import Settings
@@ -479,9 +494,11 @@ class ModernTunnelManager(tk.Tk):
         self.supervisor_client = SupervisorClient(self._project_root)
         self._supervisor_available = self.supervisor_client.is_available()
         self.auth_service = AuthService()
+        self.config_service = TunnelConfigService()
+        self.catalog_service = TunnelCatalogService(self._project_root, self.config_service)
         self.dns_service = DnsRouteService()
         self.diagnostics_service = TunnelDiagnosticsService()
-        self.lifecycle_service = TunnelLifecycleService(self.dns_service)
+        self.lifecycle_service = TunnelLifecycleService(self.dns_service, self.config_service)
         self.proc = None
         self.proc_thread = None
         self.proc_queue = queue.Queue()
@@ -2557,33 +2574,21 @@ class ModernTunnelManager(tk.Tk):
         self.logger.info("开始刷新隧道列表")
 
         def _worker(cloudflared_path: str):
-            data: list[dict] = []
-            error_msg: str | None = None
-            binary_error: str | None = None
-
-            try:
-                result = cf.list_tunnels(cloudflared_path, return_error=True, timeout=15)
-                if isinstance(result, tuple):
-                    data, error_msg = result
-                else:
-                    data, error_msg = result, None
-            except cf.CloudflaredBinaryError as exc:
-                binary_error = str(exc)
-            except Exception as exc:
-                error_msg = str(exc)
+            result = self.catalog_service.load_tunnels(cloudflared_path)
 
             def _finish():
                 self._tunnel_list_refreshing = False
 
-                if binary_error:
-                    self._append_log(f"刷新隧道失败: {binary_error}\n", "error")
-                    self.logger.error(f"刷新隧道失败: {binary_error}")
-                    messagebox.showerror("cloudflared 不可用", binary_error)
+                if result.source == "binary-error":
+                    error_text = result.error or "cloudflared 不可用"
+                    self._append_log(f"刷新隧道失败: {error_text}\n", "error")
+                    self.logger.error(f"刷新隧道失败: {error_text}")
+                    messagebox.showerror("cloudflared 不可用", error_text)
                     self.status_var.set("cloudflared 不可用")
                     self.tunnel_list.set_tunnels([], "加载失败", "请检查 cloudflared 是否可执行，或重新选择可执行文件。")
                     return
 
-                self._apply_tunnel_list_result(data, error_msg)
+                self._apply_tunnel_list_result(result)
 
             try:
                 self.after(0, _finish)
@@ -2592,55 +2597,33 @@ class ModernTunnelManager(tk.Tk):
 
         threading.Thread(target=_worker, args=(path,), daemon=True).start()
 
-    def _apply_tunnel_list_result(self, data: list[dict], error_msg: str | None):
+    def _apply_tunnel_list_result(self, result: TunnelCatalogLoadResult):
         """应用隧道列表刷新结果（必须在主线程调用）"""
-        # 无法访问 Cloudflare API 时，尝试读取本地配置作为离线列表
-        if not data:
-            local_tunnels = cf.load_local_tunnels(self._project_root)
-            if local_tunnels:
-                self._tunnels = local_tunnels
-                if error_msg:
-                    self._append_log(f"无法访问 Cloudflare API: {error_msg}\n", "warning")
-                    self.logger.warning(f"Cloudflare API 不可用: {error_msg}")
-                self._append_log("已切换为本地配置的隧道列表（离线模式）。\n", "warning")
-                self.logger.info(f"从本地配置加载 {len(local_tunnels)} 个隧道")
-                self.status_var.set("离线模式")
-                self._sync_tunnel_configs(local_tunnels)
-                self._apply_tunnel_filter()
-                return
-            if error_msg:
-                self._append_log(f"刷新隧道失败: {error_msg}\n", "error")
-                self.logger.error(f"刷新隧道失败: {error_msg}")
-                self.tunnel_list.set_tunnels([], "加载失败", "无法访问 Cloudflare API，请检查网络/代理或使用本地配置。")
-                self.status_var.set("网络不可用")
-                return
+        for msg in result.messages:
+            self._append_log(msg + "\n", "info")
+            self.logger.info(msg)
+        for msg in result.warnings:
+            self._append_log(msg + "\n", "warning")
+            self.logger.warning(msg)
 
-        self._tunnels = data
+        if not result.ok:
+            error_text = result.error or "刷新隧道失败"
+            self._append_log(f"刷新隧道失败: {error_text}\n", "error")
+            self.logger.error(f"刷新隧道失败: {error_text}")
+            self.tunnel_list.set_tunnels([], "加载失败", "无法访问 Cloudflare API，请检查网络/代理或使用本地配置。")
+            self.status_var.set("网络不可用")
+            return
 
-        # 同步配置文件
-        self._sync_tunnel_configs(data)
-
+        self._tunnels = result.tunnels
         self._apply_tunnel_filter()
-        self._append_log(f"已加载 {len(data)} 个隧道\n", "success")
-        self.logger.info(f"成功加载 {len(data)} 个隧道")
+        if result.source == "offline":
+            self.status_var.set("离线模式")
+            self.logger.info(f"从本地配置加载 {len(result.tunnels)} 个隧道")
+            return
 
-    def _sync_tunnel_configs(self, tunnels):
-        """同步所有隧道的配置文件"""
-        for tunnel in tunnels:
-            name = tunnel.get("name", "")
-            tid = cf.extract_tunnel_id(tunnel)
-            if not (name and tid):
-                continue
-
-            cfg = self._config_path_for(name)
-            if cfg.exists():
-                # 验证并更新配置文件
-                if not cf.validate_tunnel_config(cfg, tid):
-                    self._append_log(f"同步配置文件: {name}\n", "info")
-                    if cf.update_config_tunnel_id(cfg, tid):
-                        self.logger.info(f"已同步隧道 {name} 的配置文件UUID")
-                    else:
-                        self.logger.warning(f"同步隧道 {name} 的配置文件失败")
+        self.status_var.set(f"已加载 {len(result.tunnels)} 个隧道")
+        self._append_log(f"已加载 {len(result.tunnels)} 个隧道\n", "success")
+        self.logger.info(f"成功加载 {len(result.tunnels)} 个隧道")
 
     def _on_tunnel_select(self, tunnel_data):
         """隧道选择事件"""
@@ -2667,7 +2650,7 @@ class ModernTunnelManager(tk.Tk):
             messagebox.showerror("错误", "请先设置 cloudflared 路径")
             return
 
-        cert = cf.find_origin_cert(None)
+        cert = self.auth_service.find_origin_cert(None)
         if cert is None:
             messagebox.showerror("缺少认证", '未找到 Cloudflare 认证证书 cert.pem，请先点击"登录"完成授权。')
             self._append_log("未找到 cert.pem，请先运行登录\n", "warning")
@@ -2680,16 +2663,22 @@ class ModernTunnelManager(tk.Tk):
 
         self._append_log(f"正在创建隧道: {name}...\n", "info")
         self.logger.info(f"开始创建隧道: {name}")
-        ok, out = cf.create_tunnel(path, name, cert)
+        result = self.catalog_service.create_tunnel(path, name, cert)
+        for warning in result.warnings:
+            self._append_log(warning + "\n", "warning")
+            self.logger.warning(warning)
 
-        if ok:
-            self._append_log(f"隧道 {name} 创建成功\n{out}\n", "success")
-            self.logger.info(f"隧道 {name} 创建成功")
+        if result.ok:
+            self._append_log(result.message + "\n", "success")
+            if result.detail:
+                self._append_log(result.detail + "\n", "info")
+            self.logger.info(result.message)
             self.refresh_tunnels()
         else:
-            self._append_log(f"创建失败: {out}\n", "error")
-            self.logger.error(f"创建隧道失败: {out}")
-            messagebox.showerror("创建失败", out)
+            error_text = result.error or result.detail or result.message
+            self._append_log(f"创建失败: {error_text}\n", "error")
+            self.logger.error(f"创建隧道失败: {error_text}")
+            messagebox.showerror("创建失败", error_text)
 
     def _delete_selected(self):
         """删除选中的隧道"""
@@ -2706,59 +2695,26 @@ class ModernTunnelManager(tk.Tk):
 
         self._append_log(f"正在删除隧道: {name}...\n", "warning")
         self.logger.warning(f"开始删除隧道: {name}")
-        ok, out = cf.delete_tunnel(path, name)
+        result = self.catalog_service.delete_tunnel(path, name)
+        for warning in result.warnings:
+            self._append_log(warning + "\n", "warning")
+            self.logger.warning(warning)
 
-        if ok:
-            # 同时删除配置目录
-            config_dir = get_tunnels_dir() / name
-            if config_dir.exists():
-                try:
-                    shutil.rmtree(config_dir)
-                    self._append_log(f"已删除配置目录: {config_dir}\n", "info")
-                    self.logger.info(f"已删除配置目录: {config_dir}")
-                except Exception as e:
-                    self._append_log(f"删除配置目录失败: {e}\n", "warning")
-                    self.logger.warning(f"删除配置目录失败: {e}")
-
-            self._append_log(f"隧道 {name} 已删除\n", "success")
-            self.logger.info(f"隧道 {name} 已删除")
+        if result.ok:
+            self._append_log(result.message + "\n", "success")
+            if result.detail:
+                self._append_log(result.detail + "\n", "info")
+            self.logger.info(result.message)
             self.refresh_tunnels()
         else:
-            self._append_log(f"删除失败: {out}\n", "error")
-            self.logger.error(f"删除隧道失败: {out}")
-            messagebox.showerror("删除失败", out)
+            error_text = result.error or result.detail or result.message
+            self._append_log(f"删除失败: {error_text}\n", "error")
+            self.logger.error(f"删除隧道失败: {error_text}")
+            messagebox.showerror("删除失败", error_text)
 
     def _config_path_for(self, tunnel_name: str) -> Path:
         """获取隧道配置文件路径"""
-        return get_tunnels_dir() / tunnel_name / "config.yml"
-
-    def _extract_hostnames(self, cfg_path: Path) -> list[str]:
-        """读取配置文件中的 hostname 列表"""
-        return cf.extract_hostnames(cfg_path)
-
-    def _ensure_dns_routes(self, cloudflared_path: str, tunnel_name: str, hostnames: list[str]) -> bool:
-        """为所有主机名配置DNS路由"""
-        if not hostnames:
-            messagebox.showerror("缺少DNS路由", "请先在配置文件中设置 ingress.hostname")
-            return False
-
-        result = self.dns_service.ensure_routes(cloudflared_path, tunnel_name, hostnames)
-        for msg in result.get("messages", []):
-            self._append_log(msg + "\n", "success")
-            self.logger.info(msg)
-        for msg in result.get("warnings", []):
-            self._append_log(msg + "\n", "warning")
-            self.logger.warning(msg)
-
-        if result.get("ok"):
-            return True
-
-        hostname = result.get("hostname") or ""
-        error = result.get("error") or "DNS 路由失败"
-        self._append_log(f"DNS 路由失败: {error}\n", "error")
-        self.logger.error(f"DNS 路由失败: {hostname} - {error}")
-        messagebox.showerror("DNS 路由失败", f"{hostname} 配置失败：\n{error}")
-        return False
+        return self.catalog_service.config_path_for(tunnel_name)
 
     def _start_via_supervisor_if_available(self, tunnel_name: str) -> dict | None:
         """如果当前由 supervisor 托管，则转交给 supervisor 启动。"""
