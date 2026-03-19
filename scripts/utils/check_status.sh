@@ -29,17 +29,17 @@ check_service() {
     print_msg $CYAN "📊 监控服务状态"
     print_line
 
-    if systemctl is-active --quiet cloudflared-monitor.service; then
+    if systemctl is-active --quiet tunnel-monitor-improved.service; then
         print_msg $GREEN "✅ 监控服务: 运行中"
 
         # 获取服务运行时间
-        local uptime=$(systemctl show cloudflared-monitor.service --property=ActiveEnterTimestamp | cut -d= -f2)
+        local uptime=$(systemctl show tunnel-monitor-improved.service --property=ActiveEnterTimestamp | cut -d= -f2)
         if [ -n "$uptime" ]; then
             print_msg $YELLOW "   启动时间: $uptime"
         fi
 
         # 获取主进程 PID
-        local pid=$(systemctl show cloudflared-monitor.service --property=MainPID | cut -d= -f2)
+        local pid=$(systemctl show tunnel-monitor-improved.service --property=MainPID | cut -d= -f2)
         if [ "$pid" != "0" ]; then
             print_msg $YELLOW "   进程 PID: $pid"
         fi
@@ -47,7 +47,7 @@ check_service() {
         print_msg $RED "❌ 监控服务: 未运行"
     fi
 
-    if systemctl is-enabled --quiet cloudflared-monitor.service; then
+    if systemctl is-enabled --quiet tunnel-monitor-improved.service; then
         print_msg $GREEN "✅ 开机自启: 已启用"
     else
         print_msg $RED "❌ 开机自启: 未启用"
@@ -113,7 +113,7 @@ show_recent_logs() {
     print_msg $CYAN "📝 最近监控日志 (最后5条)"
     print_line
 
-    local log_file="/home/zhukunren/桌面/项目/内网穿透/logs/tunnel_monitor.log"
+    local log_file="/home/zhukunren/桌面/项目/内网穿透/logs/tunnel_monitor_improved.log"
     if [ -f "$log_file" ]; then
         tail -5 "$log_file" | while IFS= read -r line; do
             if echo "$line" | grep -q "ERROR"; then
@@ -137,16 +137,16 @@ show_commands() {
     print_msg $CYAN "🔧 常用命令"
     print_line
     echo "查看实时日志:"
-    echo "  tail -f /home/zhukunren/桌面/项目/内网穿透/logs/tunnel_monitor.log"
+    echo "  tail -f /home/zhukunren/桌面/项目/内网穿透/logs/tunnel_monitor_improved.log"
     echo ""
     echo "重启监控服务:"
-    echo "  sudo systemctl restart cloudflared-monitor"
+    echo "  sudo systemctl restart tunnel-monitor-improved.service"
     echo ""
     echo "停止监控服务:"
-    echo "  sudo systemctl stop cloudflared-monitor"
+    echo "  sudo systemctl stop tunnel-monitor-improved.service"
     echo ""
     echo "查看服务详细状态:"
-    echo "  systemctl status cloudflared-monitor"
+    echo "  systemctl status tunnel-monitor-improved.service"
 }
 
 # 主函数

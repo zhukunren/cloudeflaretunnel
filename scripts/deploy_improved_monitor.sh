@@ -26,10 +26,10 @@ fi
 echo -e "${YELLOW}1. 安装Python依赖...${NC}"
 pip3 install requests --user 2>/dev/null || true
 
-# 停止旧的监控服务
-echo -e "${YELLOW}2. 停止旧的监控服务...${NC}"
-sudo systemctl stop tunnel-monitor.service 2>/dev/null || true
-pkill -f tunnel_monitor.py 2>/dev/null || true
+# 停止当前监控服务
+echo -e "${YELLOW}2. 停止当前监控服务...${NC}"
+sudo systemctl stop tunnel-monitor-improved.service 2>/dev/null || true
+pkill -f tunnel_monitor_improved.py 2>/dev/null || true
 
 # 备份当前配置
 echo -e "${YELLOW}3. 备份当前配置...${NC}"

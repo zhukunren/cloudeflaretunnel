@@ -20,11 +20,12 @@ import time
 from dataclasses import dataclass, field
 from datetime import datetime
 from pathlib import Path
-from typing import Dict, Iterable, List, Optional
+from typing import Any, Callable, Dict, Iterable, List, Optional
 
 try:
     from . import cloudflared_cli as cf  # type: ignore
     from .config.settings import Settings  # type: ignore
+    from .services import TunnelLifecycleService  # type: ignore
     from .utils.process_tracker import ProcessTracker, SupervisorLock  # type: ignore
     from .utils.file_lock import FileLock  # type: ignore
 except (ImportError, ValueError):
@@ -33,6 +34,7 @@ except (ImportError, ValueError):
         sys.path.append(str(CURRENT_DIR))
     import cloudflared_cli as cf  # type: ignore
     from config.settings import Settings  # type: ignore
+    from services import TunnelLifecycleService  # type: ignore
     from utils.process_tracker import ProcessTracker, SupervisorLock  # type: ignore
     from utils.file_lock import FileLock  # type: ignore
 
@@ -47,7 +49,7 @@ class TunnelSpec:
 
 
 class TunnelSupervisor:
-    def __init__(self, config_path: Path | None = None):
+    def __init__(self, config_path: Path | None = None, echo_logs: bool = True):
         self.base_dir = Path(__file__).resolve().parent.parent
         self.settings = Settings(self.base_dir / "config" / "app_config.json")
         self.tracker = ProcessTracker(self.base_dir)
@@ -55,12 +57,15 @@ class TunnelSupervisor:
         self.log_file = self.base_dir / "logs" / "tunnel_supervisor.log"
         self.log_file.parent.mkdir(parents=True, exist_ok=True)
         self._log_lock = FileLock(self.log_file.parent / ".tunnel_supervisor.log.lock")
+        self.lifecycle_service = TunnelLifecycleService()
         self.config_path = config_path or (self.base_dir / "config" / "tunnels.json")
         self.manager_name = f"tunnel_supervisor@{os.getpid()}"
+        self.echo_logs = echo_logs
         self.specs: Dict[str, TunnelSpec] = {}
         self.cloudflared_path: Optional[str] = None
         self.auto_restart_default = True
         self._running = True
+        self._captured_logs: list[str] | None = None
         self._load_config()
 
     # ------------------------------------------------------------------ #
@@ -69,12 +74,29 @@ class TunnelSupervisor:
     def _log(self, level: str, message: str):
         timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
         line = f"[{timestamp}] [{level}] {message}"
-        print(line)
+        if self._captured_logs is not None:
+            self._captured_logs.append(line)
+        if self.echo_logs:
+            print(line)
         with self._log_lock.locked(timeout=1.0) as locked:
             if not locked:
-                print(f"[{timestamp}] [WARNING] 无法获取日志锁，继续无锁写入。")
+                warning = f"[{timestamp}] [WARNING] 无法获取日志锁，继续无锁写入。"
+                if self._captured_logs is not None:
+                    self._captured_logs.append(warning)
+                if self.echo_logs:
+                    print(warning)
             with open(self.log_file, "a", encoding="utf-8") as fh:
                 fh.write(line + "\n")
+
+    def capture_command(self, action: Callable[[], Any]) -> tuple[Any, list[str]]:
+        previous = self._captured_logs
+        captured: list[str] = []
+        self._captured_logs = captured
+        try:
+            result = action()
+        finally:
+            self._captured_logs = previous
+        return result, captured
 
     def _discover_cloudflared(self) -> str | None:
         configured = self.settings.get("cloudflared.path")
@@ -151,6 +173,28 @@ class TunnelSupervisor:
                 tags=item.get("tags") or [],
             )
 
+        # 兼容 GUI 创建/管理的隧道：自动扫描 tunnels/<name>/config.yml，
+        # 将未出现在 config/tunnels.json 的隧道纳入守护范围，默认 auto_start=True。
+        tunnels_dir = self.base_dir / "tunnels"
+        if tunnels_dir.exists():
+            for cfg in sorted(tunnels_dir.glob("*/config.yml")):
+                name = cfg.parent.name
+                if not name:
+                    continue
+                if name in specs:
+                    continue
+                specs[name] = TunnelSpec(
+                    name=name,
+                    config=cfg,
+                    auto_start=True,
+                    health_check=True,
+                    tags=["discovered"],
+                )
+
+        for spec in specs.values():
+            if not spec.config.exists():
+                self._log("WARNING", f"隧道 {spec.name} 配置文件不存在，将跳过自动启动：{spec.config}")
+
         if not specs:
             self._log("WARNING", "配置中未包含任何隧道，守护进程将空闲等待。")
         self.specs = specs
@@ -180,85 +224,51 @@ class TunnelSupervisor:
         log_dir = self.base_dir / "logs" / "persistent"
         log_dir.mkdir(parents=True, exist_ok=True)
         log_file = log_dir / f"{name}.log"
+        result = self.lifecycle_service.launch_tunnel(
+            self.cloudflared_path,
+            name,
+            spec.config,
+            capture_output=False,
+            log_file=log_file,
+            health_timeout=8,
+            max_wait_seconds=12,
+        )
+        if result.get("ok"):
+            proc = result.get("proc")
+            protocol = result.get("protocol", "默认")
+            detail = result.get("detail", "")
+            if not proc:
+                self._log("ERROR", f"隧道 {name} 启动结果缺少进程句柄")
+                return False
 
-        max_wait = 12
-        cfg_protocol = (cf.get_config_protocol(spec.config) or "").lower() or None
-        protocol_candidates: list[tuple[str | None, str]] = []
-        # 首选配置文件中的协议（或默认）
-        protocol_candidates.append((cfg_protocol, cfg_protocol or "默认"))
-        # 如果未显式使用 http2，则在失败时自动回退
-        if cfg_protocol != "http2":
-            protocol_candidates.append(("http2", "http2"))
+            self.tracker.register(
+                name,
+                proc.pid,
+                manager="tunnel_supervisor",
+                mode="supervised",
+                metadata={"reason": reason, "log_file": str(log_file), "protocol": protocol},
+            )
+            self._log("INFO", f"隧道 {name} 启动成功（协议 {protocol}），PID {proc.pid}")
+            if detail and "Cloudflare API 无响应" in detail:
+                self._log("INFO", f"隧道 {name} 健康状态未知，保持运行：{detail}")
+            return True
 
-        def _wait_ready(proc: subprocess.Popen, label: str) -> tuple[bool, str]:
-            last_detail = ""
-            unknown_seen = False
-            unknown_detail = ""
-            for i in range(max_wait):
-                time.sleep(1)
-                if proc.poll() is not None:
-                    return False, f"cloudflared 进程异常退出，返回码 {proc.returncode}"
-                if i % 2 == 1:
-                    ok, detail = self._health_check(name)
-                    last_detail = detail
-                    if ok is True:
-                        self.tracker.register(
-                            name,
-                            proc.pid,
-                            manager="tunnel_supervisor",
-                            mode="supervised",
-                            metadata={"reason": reason, "log_file": str(log_file), "protocol": label},
-                        )
-                        self._log("INFO", f"隧道 {name} 启动成功（协议 {label}），PID {proc.pid}")
-                        return True, detail
-                    if ok is None:
-                        unknown_seen = True
-                        unknown_detail = detail
-                        continue
-            if unknown_seen and proc.poll() is None:
-                self.tracker.register(
-                    name,
-                    proc.pid,
-                    manager="tunnel_supervisor",
-                    mode="supervised",
-                    metadata={"reason": reason, "log_file": str(log_file), "protocol": label},
-                )
+        error = result.get("error") or "未检测到活跃连接"
+        if result.get("error_type") == "credentials":
+            self._log("ERROR", f"启动隧道 {name} 失败: {error}")
+            if spec.auto_start and "auto" in reason:
+                spec.auto_start = False
                 self._log(
-                    "INFO",
-                    f"隧道 {name} 健康状态未知（可能 Cloudflare API 不可用），保持运行，PID {proc.pid}",
+                    "WARNING",
+                    f"已自动关闭隧道 {name} 的 auto_start（无法获取凭据/token）。"
+                    "请确认隧道已创建且当前账号已登录 cloudflared。",
                 )
-                return True, unknown_detail or "Cloudflare API 无响应"
-            return False, last_detail
-
-        last_detail = ""
-        for idx, (proto, label) in enumerate(protocol_candidates):
-            try:
-                proc = cf.run_tunnel(
-                    self.cloudflared_path,
-                    name,
-                    spec.config,
-                    capture_output=False,
-                    log_file=log_file,
-                    protocol=proto,
-                )
-            except Exception as exc:
-                self._log("ERROR", f"启动隧道 {name} 失败（协议 {label}）: {exc}")
-                continue
-
-            ok, detail = _wait_ready(proc, label)
-            if ok:
-                return True
-
-            last_detail = detail
-            # 未连通则停止当前尝试，准备回退
-            cf.stop_process(proc)
-            if idx + 1 < len(protocol_candidates):
-                self._log("WARNING", f"隧道 {name} 使用协议 {label} 未检测到活跃连接，尝试使用 http2 重新启动。")
+            return False
 
         self._log(
             "WARNING",
-            f"隧道 {name} 启动超时（{max_wait}s 内未检测到活跃连接），稍后将由监控重试。"
-            f"{' 详情: ' + last_detail if last_detail else ''}",
+            f"隧道 {name} 启动超时（12s 内未检测到活跃连接），稍后将由监控重试。"
+            f"{' 详情: ' + error if error else ''}",
         )
         return False
 
@@ -295,6 +305,8 @@ class TunnelSupervisor:
             return None, f"health-check 执行失败（未知状态）：{exc}"
 
     def _should_auto_start(self, spec: TunnelSpec) -> bool:
+        if not spec.config.exists():
+            return False
         # 显式关闭时必须尊重配置，未配置时才退回全局默认
         if spec.auto_start is False:
             return False
@@ -302,40 +314,148 @@ class TunnelSupervisor:
             return True
         return bool(self.auto_restart_default)
 
+    @staticmethod
+    def _status_summary(detail: str) -> str:
+        if not detail:
+            return ""
+        for line in detail.splitlines():
+            text = line.strip()
+            if text:
+                if len(text) > 160:
+                    return text[:157] + "..."
+                return text
+        return ""
+
+    @staticmethod
+    def _status_state(configured: bool, running: bool, healthy: bool | None) -> str:
+        if not configured:
+            return "未配置"
+        if not running:
+            return "未运行"
+        if healthy is True:
+            return "健康"
+        if healthy is None:
+            return "状态未知"
+        return "异常"
+
+    def _status_entry(self, name: str) -> dict:
+        spec = self.specs.get(name)
+        if not spec:
+            return {
+                "name": name,
+                "configured": False,
+                "running": False,
+                "healthy": False,
+                "state": self._status_state(False, False, False),
+                "manager": None,
+                "pid": None,
+                "auto_start": None,
+                "summary": "",
+                "detail": "",
+                "config": None,
+            }
+
+        record = self.tracker.read(name)
+        running = bool(record and record.alive)
+        manager = record.manager if record else None
+        pid = record.pid if record else None
+        healthy: bool | None = False
+        detail = ""
+        if running and manager == "tunnel_supervisor":
+            healthy, detail = self._health_check(name)
+        elif running:
+            healthy = True
+
+        return {
+            "name": name,
+            "configured": True,
+            "running": running,
+            "healthy": healthy,
+            "state": self._status_state(True, running, healthy),
+            "manager": manager,
+            "pid": pid,
+            "auto_start": spec.auto_start,
+            "summary": self._status_summary(detail),
+            "detail": detail.strip(),
+            "config": str(spec.config),
+            "health_check": spec.health_check,
+            "tags": list(spec.tags),
+        }
+
+    def status_entries(self, target: str | None = None) -> list[dict]:
+        names = [target] if target else list(self.specs.keys())
+        return [self._status_entry(name) for name in names]
+
+    def render_status_entries(self, entries: list[dict]) -> str:
+        lines: list[str] = []
+        for entry in entries:
+            if not entry.get("configured"):
+                lines.append(f"- {entry['name']}: 未在配置中定义")
+                continue
+
+            manager = entry.get("manager") or "-"
+            pid = entry.get("pid") if entry.get("pid") is not None else "-"
+            lines.append(
+                f"- {entry['name']:12} state={entry.get('state')} "
+                f"running={entry['running']} healthy={entry['healthy']} "
+                f"manager={manager} pid={pid} auto_start={entry['auto_start']}"
+            )
+            summary = entry.get("summary")
+            if summary:
+                lines.append(f"    {summary}")
+        return "\n".join(lines)
+
+    def render_status(self, target: str | None = None) -> str:
+        return self.render_status_entries(self.status_entries(target))
+
+    def specs_data(self) -> list[dict]:
+        return [
+            {
+                "name": spec.name,
+                "config": str(spec.config),
+                "auto_start": spec.auto_start,
+                "health_check": spec.health_check,
+                "tags": list(spec.tags),
+            }
+            for spec in self.specs.values()
+        ]
+
+    def render_specs(self) -> str:
+        lines = [
+            f"- {item['name']:12} auto_start={item['auto_start']} health_check={item['health_check']} "
+            f"config={item['config']}"
+            for item in self.specs_data()
+        ]
+        return "\n".join(lines)
+
+    def lock_status_data(self) -> dict | None:
+        info = self.lock.info()
+        if not info:
+            return None
+        return dict(info)
+
+    def render_lock_status(self) -> str:
+        info = self.lock_status_data()
+        if not info:
+            return "未发现运行中的隧道守护进程。"
+        return (
+            f"锁文件: {info.get('path')}\n"
+            f"PID: {info.get('pid')} (alive={info.get('alive')})\n"
+            f"Owner: {info.get('owner')} @ {info.get('host')} 创建于 {info.get('created_at')}"
+        )
+
     # ------------------------------------------------------------------ #
     # 状态/监控
     # ------------------------------------------------------------------ #
     def list_specs(self):
-        for spec in self.specs.values():
-            print(
-                f"- {spec.name:12} auto_start={spec.auto_start} health_check={spec.health_check} "
-                f"config={spec.config}"
-            )
+        text = self.render_specs()
+        if text:
+            print(text)
 
     def print_status(self, target: str | None = None):
-        names = [target] if target else list(self.specs.keys())
-        for name in names:
-            spec = self.specs.get(name)
-            if not spec:
-                print(f"- {name}: 未在配置中定义")
-                continue
-            record = self.tracker.read(name)
-            running = bool(record and record.alive)
-            manager = record.manager if record else "-"
-            pid = record.pid if record else "-"
-            healthy = False
-            detail = ""
-            if running and manager == "tunnel_supervisor":
-                healthy, detail = self._health_check(name)
-            elif running:
-                healthy = True
-
-            print(
-                f"- {name:12} running={running} healthy={healthy} manager={manager} "
-                f"pid={pid} auto_start={spec.auto_start}"
-            )
-            if detail:
-                print(f"    {detail.strip()}")
+        text = self.render_status(target)
+        if text:
+            print(text)
 
     def watch(self, interval: int = 30):
         if self.lock.is_active():
@@ -355,30 +475,37 @@ class TunnelSupervisor:
 
         try:
             while self._running:
-                self.tracker.cleanup_dead()
-                for spec in self.specs.values():
-                    record = self.tracker.read(spec.name)
-                    if record and record.alive and record.manager != "tunnel_supervisor":
-                        self._log(
-                            "WARNING",
-                            f"检测到隧道 {spec.name} 由 {record.manager} 管理 (PID {record.pid})，跳过自动控制。",
-                        )
-                        continue
+                sleep_seconds = interval
+                try:
+                    self.tracker.cleanup_dead()
+                    for spec in self.specs.values():
+                        record = self.tracker.read(spec.name)
+                        if record and record.alive and record.manager != "tunnel_supervisor":
+                            self._log(
+                                "WARNING",
+                                f"检测到隧道 {spec.name} 由 {record.manager} 管理 (PID {record.pid})，跳过自动控制。",
+                            )
+                            continue
 
-                    if record and record.alive:
-                        if spec.health_check:
-                            ok, detail = self._health_check(spec.name)
-                            if ok is False:
-                                self._log("WARNING", f"{spec.name} 健康检查失败：{detail}")
-                                self.restart_tunnel(spec.name, reason="health-check")
-                            elif ok is None:
-                                self._log("INFO", f"{spec.name} 健康状态未知（跳过自动重启）：{detail}")
-                        continue
+                        if record and record.alive:
+                            if spec.health_check:
+                                ok, detail = self._health_check(spec.name)
+                                if ok is False:
+                                    self._log("WARNING", f"{spec.name} 健康检查失败：{detail}")
+                                    self.restart_tunnel(spec.name, reason="health-check")
+                                elif ok is None:
+                                    self._log("INFO", f"{spec.name} 健康状态未知（跳过自动重启）：{detail}")
+                            continue
 
-                    if self._should_auto_start(spec):
-                        self.start_tunnel(spec.name, reason="auto-start")
+                        if self._should_auto_start(spec):
+                            self.start_tunnel(spec.name, reason="auto-start")
+                except Exception:
+                    import traceback
 
-                time.sleep(interval)
+                    self._log("ERROR", f"监控循环异常:\n{traceback.format_exc()}")
+                    sleep_seconds = min(interval, 5)
+
+                time.sleep(sleep_seconds)
         finally:
             self.lock.release()
             self._log("INFO", "守护进程已退出并释放锁。")
@@ -391,20 +518,27 @@ class TunnelSupervisor:
         self._log("INFO", "已清理失效的 PID 文件。")
 
     def lock_status(self):
-        info = self.lock.info()
-        if not info:
-            print("未发现运行中的隧道守护进程。")
-            return
-        print(
-            f"锁文件: {info.get('path')}\n"
-            f"PID: {info.get('pid')} (alive={info.get('alive')})\n"
-            f"Owner: {info.get('owner')} @ {info.get('host')} 创建于 {info.get('created_at')}"
-        )
+        print(self.render_lock_status())
+
+
+def _command_message(logs: list[str], default: str) -> str:
+    if not logs:
+        return default
+    last = logs[-1].strip()
+    parts = last.split("] ", 2)
+    if len(parts) == 3:
+        return parts[2].strip()
+    return last
+
+
+def _emit_json(payload: dict) -> None:
+    print(json.dumps(payload, ensure_ascii=False))
 
 
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description="Cloudflared 多隧道守护进程")
     parser.add_argument("--config", help="指定隧道配置文件 (默认: config/tunnels.json)")
+    parser.add_argument("--json", action="store_true", dest="json_output", help="以 JSON 输出结果")
 
     sub = parser.add_subparsers(dest="command")
 
@@ -430,31 +564,132 @@ def build_parser() -> argparse.ArgumentParser:
     return parser
 
 
-def main():
+def main() -> int:
     parser = build_parser()
-    args = parser.parse_args()
-    config_path = Path(args.config).resolve() if args.config else None
-    supervisor = TunnelSupervisor(config_path=config_path)
+    try:
+        args = parser.parse_args()
+        config_path = Path(args.config).resolve() if args.config else None
+        supervisor = TunnelSupervisor(config_path=config_path, echo_logs=not args.json_output)
 
-    if args.command == "start":
-        supervisor.start_tunnel(args.name, reason="manual-cli")
-    elif args.command == "stop":
-        supervisor.stop_tunnel(args.name, reason="manual-cli")
-    elif args.command == "restart":
-        supervisor.restart_tunnel(args.name, reason="manual-cli")
-    elif args.command == "status":
-        supervisor.print_status(args.name)
-    elif args.command == "list":
-        supervisor.list_specs()
-    elif args.command == "cleanup":
-        supervisor.cleanup_pid_files()
-    elif args.command == "lock-status":
-        supervisor.lock_status()
-    elif args.command == "watch":
-        supervisor.watch(interval=args.interval)
-    else:
+        if args.command == "start":
+            ok, logs = supervisor.capture_command(lambda: supervisor.start_tunnel(args.name, reason="manual-cli"))
+            if args.json_output:
+                _emit_json(
+                    {
+                        "ok": bool(ok),
+                        "command": "start",
+                        "name": args.name,
+                        "logs": logs,
+                        "message": _command_message(logs, f"隧道 {args.name} {'启动成功' if ok else '启动失败'}"),
+                    }
+                )
+            return 0 if ok else 1
+        if args.command == "stop":
+            ok, logs = supervisor.capture_command(lambda: supervisor.stop_tunnel(args.name, reason="manual-cli"))
+            if args.json_output:
+                _emit_json(
+                    {
+                        "ok": bool(ok),
+                        "command": "stop",
+                        "name": args.name,
+                        "logs": logs,
+                        "message": _command_message(logs, f"隧道 {args.name} {'已停止' if ok else '停止失败'}"),
+                    }
+                )
+            return 0 if ok else 1
+        if args.command == "restart":
+            ok, logs = supervisor.capture_command(lambda: supervisor.restart_tunnel(args.name, reason="manual-cli"))
+            if args.json_output:
+                _emit_json(
+                    {
+                        "ok": bool(ok),
+                        "command": "restart",
+                        "name": args.name,
+                        "logs": logs,
+                        "message": _command_message(logs, f"隧道 {args.name} {'重启成功' if ok else '重启失败'}"),
+                    }
+                )
+            return 0 if ok else 1
+        if args.command == "status":
+            if args.json_output:
+                entries = supervisor.status_entries(args.name)
+                configured = not args.name or bool(entries and entries[0].get("configured"))
+                _emit_json(
+                    {
+                        "ok": configured,
+                        "command": "status",
+                        "name": args.name,
+                        "entries": entries,
+                        "message": supervisor.render_status_entries(entries),
+                    }
+                )
+                return 0 if configured else 1
+            supervisor.print_status(args.name)
+            return 0
+        if args.command == "list":
+            if args.json_output:
+                _emit_json(
+                    {
+                        "ok": True,
+                        "command": "list",
+                        "tunnels": supervisor.specs_data(),
+                        "message": supervisor.render_specs(),
+                    }
+                )
+                return 0
+            supervisor.list_specs()
+            return 0
+        if args.command == "cleanup":
+            if args.json_output:
+                _, logs = supervisor.capture_command(supervisor.cleanup_pid_files)
+                _emit_json(
+                    {
+                        "ok": True,
+                        "command": "cleanup",
+                        "logs": logs,
+                        "message": _command_message(logs, "已清理失效的 PID 文件。"),
+                    }
+                )
+                return 0
+            supervisor.cleanup_pid_files()
+            return 0
+        if args.command == "lock-status":
+            if args.json_output:
+                info = supervisor.lock_status_data()
+                _emit_json(
+                    {
+                        "ok": True,
+                        "command": "lock-status",
+                        "active": bool(info),
+                        "lock": info,
+                        "message": supervisor.render_lock_status(),
+                    }
+                )
+                return 0
+            supervisor.lock_status()
+            return 0
+        if args.command == "watch":
+            if args.json_output:
+                _emit_json(
+                    {
+                        "ok": False,
+                        "command": "watch",
+                        "message": "watch 模式不支持 JSON 流式输出。",
+                    }
+                )
+                return 1
+            supervisor.watch(interval=args.interval)
+            return 0
+
         parser.print_help()
+        return 1
+    except Exception as exc:
+        if "args" in locals() and getattr(args, "json_output", False):
+            _emit_json({"ok": False, "command": getattr(args, "command", None), "message": str(exc)})
+        else:
+            print(str(exc), file=sys.stderr)
+        return 1
 
 
 if __name__ == "__main__":
-    main()
+    raise SystemExit(main())

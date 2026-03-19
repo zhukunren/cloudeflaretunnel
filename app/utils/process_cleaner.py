@@ -115,6 +115,7 @@ class ProcessCleaner:
                     ["taskkill", "/PID", str(pid), "/T", *flags],
                     stdout=subprocess.DEVNULL,
                     stderr=subprocess.DEVNULL,
+                    creationflags=0x08000000,
                     check=False,
                 )
                 signal_name = "taskkill /F" if force else "taskkill"

@@ -13,7 +13,7 @@ except Exception:
     from tunnel_monitor_improved import monitor_tunnel
 
 
-if __name__ == "__main__":
+def main() -> int:
     import sys
 
     # 如果有隧道名参数，则作为隧道监控脚本运行
@@ -26,3 +26,11 @@ if __name__ == "__main__":
         # 先执行进程清理，然后启动GUI
         cleanup_on_startup()
         run_modern_app()
+    return 0
+
+
+if __name__ == "__main__":
+    try:
+        raise SystemExit(main())
+    except KeyboardInterrupt:
+        raise SystemExit(130)

@@ -97,8 +97,7 @@ else
     echo -e "   ${RED}✗ Supervisor 未运行${NC}"
     echo "     建议执行: sudo $PROJECT_ROOT/scripts/deploy_supervisor.sh"
 fi
-if systemctl is-active --quiet tunnel-monitor-improved.service 2>/dev/null || \
-   systemctl is-active --quiet tunnel-monitor.service 2>/dev/null; then
+if systemctl is-active --quiet tunnel-monitor-improved.service 2>/dev/null; then
     echo -e "   ${YELLOW}⚠ 仍检测到旧监控服务，请先停止以避免冲突${NC}"
 fi
 echo ""

@@ -22,8 +22,6 @@ require_root() {
 stop_old_services() {
     local services=(
         tunnel-monitor-improved.service
-        tunnel-monitor.service
-        cloudflared-monitor.service
     )
     for svc in "${services[@]}"; do
         if systemctl list-unit-files | grep -q "^${svc}"; then

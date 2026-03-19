@@ -44,7 +44,7 @@ python -m app.tunnel_supervisor watch --interval 30
 
 - Follow the existing commit style: `feat: ...`, `fix: ...`, `chore: ...` (Chinese descriptions are OK).
 - PRs should include: clear description, reproduction/verification steps, and screenshots for UI changes.
-- Keep changes focused; update relevant docs (`app/README.md`, `app/TROUBLESHOOTING.md`) when behavior changes.
+- Keep changes focused; update relevant docs (`README.md`, `docs/TROUBLESHOOTING.md`) when behavior changes.
 
 ## Configuration & Security Tips
 

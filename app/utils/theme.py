@@ -2,6 +2,7 @@
 """
 增强的主题系统
 """
+import platform
 
 
 class Theme:
@@ -95,6 +96,37 @@ class Theme:
     TRANSITION_FAST = 150
     TRANSITION_BASE = 200
     TRANSITION_SLOW = 300
+
+    WINDOWS_ICON_FALLBACKS = {
+        "🚇": "≡",
+        "🕳": "○",
+        "📊": "▦",
+        "🔑": "◇",
+        "📁": "▤",
+        "🔄": "↻",
+        "🗑": "✕",
+        "🔍": "⌕",
+        "🌐": "◎",
+        "🧪": "◇",
+        "📝": "✎",
+        "📍": "•",
+        "⏳": "…",
+    }
+
+    @classmethod
+    def ui_text(cls, text: str) -> str:
+        """Normalize icon-heavy UI text for Tk on Windows."""
+        if not text:
+            return text
+
+        normalized = str(text)
+        if platform.system() != "Windows":
+            return normalized
+
+        normalized = normalized.replace("\ufe0f", "")
+        for source, replacement in cls.WINDOWS_ICON_FALLBACKS.items():
+            normalized = normalized.replace(source, replacement)
+        return normalized
 
 
 class DarkTheme(Theme):

@@ -112,7 +112,10 @@ class ProcessTracker:
         except Exception:
             return None
 
-        pid = int(data.get("pid", 0) or 0)
+        try:
+            pid = int(data.get("pid", 0) or 0)
+        except Exception:
+            pid = 0
         alive = self._is_pid_running(pid)
         return ProcessRecord(
             name=str(data.get("name") or tunnel_name),
@@ -168,15 +171,53 @@ class ProcessTracker:
     def _is_pid_running(pid: int) -> bool:
         if not pid or pid <= 0:
             return False
+        if os.name == "nt":
+            return ProcessTracker._is_pid_running_windows(pid)
         try:
             os.kill(pid, 0)
         except ProcessLookupError:
             return False
         except PermissionError:
             return True
-        except OSError:
+        except Exception:
             return False
         return True
+
+    @staticmethod
+    def _is_pid_running_windows(pid: int) -> bool:
+        """Windows 下判断 PID 是否仍在运行。
+
+        不能使用 os.kill(pid, 0)：在 Windows / Python 3.12 上可能触发 WinError 87，
+        甚至升级为 SystemError（<class 'OSError'> returned a result with an exception set）。
+        """
+        import ctypes
+        from ctypes import wintypes
+
+        kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+
+        kernel32.OpenProcess.argtypes = [wintypes.DWORD, wintypes.BOOL, wintypes.DWORD]
+        kernel32.OpenProcess.restype = wintypes.HANDLE
+        kernel32.GetExitCodeProcess.argtypes = [wintypes.HANDLE, ctypes.POINTER(wintypes.DWORD)]
+        kernel32.GetExitCodeProcess.restype = wintypes.BOOL
+        kernel32.CloseHandle.argtypes = [wintypes.HANDLE]
+        kernel32.CloseHandle.restype = wintypes.BOOL
+
+        PROCESS_QUERY_LIMITED_INFORMATION = 0x1000
+        handle = kernel32.OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, False, wintypes.DWORD(pid))
+        if not handle:
+            # ERROR_ACCESS_DENIED：进程存在但无权限查询
+            if ctypes.get_last_error() == 5:
+                return True
+            return False
+
+        try:
+            exit_code = wintypes.DWORD()
+            if not kernel32.GetExitCodeProcess(handle, ctypes.byref(exit_code)):
+                return True
+            STILL_ACTIVE = 259
+            return exit_code.value == STILL_ACTIVE
+        finally:
+            kernel32.CloseHandle(handle)
 
     def terminate_pid(self, pid: int) -> bool:
         """向目标 PID 发送 SIGTERM/SIGKILL（用于守护进程停止隧道）"""
@@ -190,6 +231,7 @@ class ProcessTracker:
                     ["taskkill", "/PID", str(pid), "/T", "/F"],
                     stdout=subprocess.DEVNULL,
                     stderr=subprocess.DEVNULL,
+                    creationflags=0x08000000,
                     check=False,
                 )
             else:
@@ -210,6 +252,7 @@ class SupervisorLock:
         self.lock_path = self.base_dir / "logs" / "pids" / "tunnel_supervisor.lock"
         self.lock_path.parent.mkdir(parents=True, exist_ok=True)
         self._lock = FileLock(self.lock_path.with_suffix(".lockfile"))
+        self._held = False
 
     @staticmethod
     def _write_json_atomic(path: Path, payload: dict):
@@ -217,6 +260,37 @@ class SupervisorLock:
         temp = path.with_suffix(path.suffix + ".tmp")
         temp.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
         temp.replace(path)
+
+    @staticmethod
+    def _boot_time_epoch() -> float | None:
+        if os.name == "nt":
+            try:
+                import ctypes
+
+                uptime_ms = ctypes.windll.kernel32.GetTickCount64()  # type: ignore[attr-defined]
+                return time.time() - (float(uptime_ms) / 1000.0)
+            except Exception:
+                return None
+
+        uptime_path = Path("/proc/uptime")
+        if not uptime_path.exists():
+            return None
+        try:
+            uptime = float(uptime_path.read_text(encoding="utf-8", errors="ignore").split()[0])
+            return time.time() - uptime
+        except Exception:
+            return None
+
+    @staticmethod
+    def _created_at_epoch(value: str) -> float | None:
+        raw = (value or "").strip()
+        if not raw:
+            return None
+        try:
+            dt = datetime.fromisoformat(raw.replace("Z", "+00:00"))
+            return dt.timestamp()
+        except Exception:
+            return None
 
     def info(self) -> dict | None:
         if not self.lock_path.exists():
@@ -227,16 +301,23 @@ class SupervisorLock:
             return None
         pid = int(data.get("pid", 0) or 0)
         alive = ProcessTracker._is_pid_running(pid)
+
+        boot_time = self._boot_time_epoch()
+        created_at = self._created_at_epoch(str(data.get("created_at") or ""))
+        if boot_time and created_at and created_at < (boot_time - 1.0):
+            alive = False
+
         data["alive"] = alive
         data["path"] = str(self.lock_path)
         return data
 
     def acquire(self, owner: str):
-        with self._lock.locked(timeout=2.0) as locked:
-            if not locked:
-                raise RuntimeError(
-                    "SupervisorLock: 获取锁超时，无法安全启动守护进程"
-                )
+        if self._held:
+            return
+        if not self._lock.acquire(timeout=2.0):
+            raise RuntimeError("SupervisorLock: 获取锁超时，无法安全启动守护进程")
+
+        try:
             info = self.info()
             if info and info.get("alive"):
                 raise RuntimeError(
@@ -249,12 +330,26 @@ class SupervisorLock:
                 "host": socket.gethostname(),
             }
             self._write_json_atomic(self.lock_path, payload)
+            self._held = True
+        except Exception:
+            try:
+                self._lock.release()
+            finally:
+                self._held = False
+            raise
 
     def release(self):
-        with self._lock.locked(timeout=2.0) as locked:
-            if not locked:
-                print("SupervisorLock: 获取锁超时，尝试无锁释放。")
-            self.lock_path.unlink(missing_ok=True)
+        try:
+            try:
+                self.lock_path.unlink(missing_ok=True)
+            except Exception:
+                pass
+        finally:
+            if self._held:
+                try:
+                    self._lock.release()
+                finally:
+                    self._held = False
 
     def is_active(self) -> bool:
         info = self.info()

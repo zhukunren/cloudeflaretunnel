@@ -18,12 +18,17 @@ build/
 *.swp
 *.swo
 *~
+.claude/
+app/.claude/
 
 # Logs
 logs/*.log
 logs/persistent/*.log
 logs/tunnel_*.log
 logs/cloudflared_*.log
+logs/*.lock
+logs/*.txt
+logs/pids/
 *.pid
 
 # Temporary files

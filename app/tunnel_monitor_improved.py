@@ -4,13 +4,14 @@
 修复了连接检测不准确和重连不稳定的问题
 """
 
+from __future__ import annotations
+
 import subprocess
 import time
 import signal
 import sys
 import os
 import json
-import re
 from datetime import datetime
 from pathlib import Path
 import urllib.request
@@ -26,22 +27,33 @@ except Exception:
 
 try:
     from . import cloudflared_cli as cf  # type: ignore
+    from .services import TunnelLifecycleService  # type: ignore
 except Exception:
     try:
         import cloudflared_cli as cf  # type: ignore
+        from services import TunnelLifecycleService  # type: ignore
     except Exception:
         cf = None  # type: ignore
+        TunnelLifecycleService = None  # type: ignore
 
 # 配置参数
 TUNNEL_NAME = "homepage"  # 默认隧道名称
 CHECK_INTERVAL = 30  # 检查间隔（秒）- 缩短到30秒
 RESTART_DELAY = 10  # 重启延迟（秒）- 增加到10秒
 MAX_RESTART_ATTEMPTS = 5  # 最大重启尝试次数 - 增加到5次
+STARTUP_HEALTH_TIMEOUT = 15
+STARTUP_WAIT_SECONDS = 20
+UDP_BUFFER_SIZE = "7340032"
 METRICS_PORT = None  # Metrics端口，运行时按隧道名生成，避免冲突
 LOG_FILE = Path(__file__).parent.parent / "logs" / "tunnel_monitor_improved.log"
 PROJECT_ROOT = Path(__file__).parent.parent
 LOCK_FILE = Path(__file__).parent.parent / "logs" / "pids" / "tunnel_supervisor.lock"
 _log_lock = FileLock(LOG_FILE.parent / ".tunnel_monitor_improved.log.lock") if FileLock else None
+lifecycle_service = TunnelLifecycleService() if TunnelLifecycleService else None
+
+
+def _windows_creationflags() -> int:
+    return 0x08000000 if os.name == "nt" else 0
 
 
 def get_cloudflared_path() -> str:
@@ -79,6 +91,42 @@ def _current_metrics_port(tunnel_name: str | None = None) -> int:
     name = tunnel_name or current_tunnel_name or TUNNEL_NAME
     return METRICS_PORT or get_metrics_port(name)
 
+
+def _metrics_address(tunnel_name: str) -> str:
+    return f"localhost:{_current_metrics_port(tunnel_name)}"
+
+
+def _persistent_tunnel_log_path(tunnel_name: str) -> Path:
+    log_dir = PROJECT_ROOT / "logs" / "persistent"
+    log_dir.mkdir(parents=True, exist_ok=True)
+    return log_dir / f"cloudflared_{tunnel_name}.log"
+
+
+def _require_lifecycle_service():
+    if lifecycle_service is None:
+        raise RuntimeError("TunnelLifecycleService 不可用")
+    return lifecycle_service
+
+
+def _log_config_warnings(result: dict) -> None:
+    for warning in result.get("warnings", []):
+        log("WARNING", str(warning))
+
+
+def _cleanup_residual_tunnel(tunnel_name: str) -> None:
+    if not check_tunnel_process(tunnel_name):
+        return
+
+    service = _require_lifecycle_service()
+    cleaned, message, error = service.cleanup_residual_tunnel(tunnel_name)
+    if error:
+        log("WARNING", f"清理残留进程失败: {error}")
+        return
+    if message:
+        level = "INFO" if cleaned else "WARNING"
+        log(level, message)
+
+
 # 确保日志目录存在
 LOG_FILE.parent.mkdir(parents=True, exist_ok=True)
 
@@ -94,15 +142,47 @@ current_tunnel_name = None  # 当前监控的隧道名称
 def _is_pid_running(pid: int) -> bool:
     if not pid or pid <= 0:
         return False
+    if os.name == "nt":
+        return _is_pid_running_windows(pid)
     try:
         os.kill(pid, 0)
     except ProcessLookupError:
         return False
     except PermissionError:
         return True
-    except OSError:
+    except Exception:
         return False
     return True
+
+
+def _is_pid_running_windows(pid: int) -> bool:
+    import ctypes
+    from ctypes import wintypes
+
+    kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+
+    kernel32.OpenProcess.argtypes = [wintypes.DWORD, wintypes.BOOL, wintypes.DWORD]
+    kernel32.OpenProcess.restype = wintypes.HANDLE
+    kernel32.GetExitCodeProcess.argtypes = [wintypes.HANDLE, ctypes.POINTER(wintypes.DWORD)]
+    kernel32.GetExitCodeProcess.restype = wintypes.BOOL
+    kernel32.CloseHandle.argtypes = [wintypes.HANDLE]
+    kernel32.CloseHandle.restype = wintypes.BOOL
+
+    PROCESS_QUERY_LIMITED_INFORMATION = 0x1000
+    handle = kernel32.OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, False, wintypes.DWORD(pid))
+    if not handle:
+        if ctypes.get_last_error() == 5:
+            return True
+        return False
+
+    try:
+        exit_code = wintypes.DWORD()
+        if not kernel32.GetExitCodeProcess(handle, ctypes.byref(exit_code)):
+            return True
+        STILL_ACTIVE = 259
+        return exit_code.value == STILL_ACTIVE
+    finally:
+        kernel32.CloseHandle(handle)
 
 
 def supervisor_active() -> bool:
@@ -150,29 +230,9 @@ def get_tunnel_config_path(tunnel_name: str) -> Path:
     config_path = base_path / "tunnels" / tunnel_name / "config.yml"
     return config_path
 
-def get_tunnel_protocol(tunnel_name: str, default: str = "http2") -> str:
-    """从隧道配置中读取 protocol（默认 http2，避免 QUIC/UDP 不稳定导致无连接）。"""
-    config_path = get_tunnel_config_path(tunnel_name)
-    if not config_path.exists():
-        return default
-    try:
-        text = config_path.read_text(encoding="utf-8", errors="ignore")
-    except Exception:
-        return default
-
-    for raw in text.splitlines():
-        line = raw.strip()
-        if not line or line.startswith("#"):
-            continue
-        m = re.match(r"^protocol\s*:\s*([^\s#]+)\s*$", line, flags=re.IGNORECASE)
-        if m:
-            value = m.group(1).strip().strip("'\"")
-            return value or default
-    return default
-
-def check_metrics_endpoint() -> dict:
+def check_metrics_endpoint(tunnel_name: str | None = None) -> dict:
     """检查cloudflared metrics端点获取隧道状态"""
-    port = _current_metrics_port()
+    port = _current_metrics_port(tunnel_name)
     try:
         req = urllib.request.Request(f"http://localhost:{port}/ready")
         req.add_header('User-Agent', 'tunnel-monitor/1.0')
@@ -203,7 +263,8 @@ def check_tunnel_connections(tunnel_name: str) -> tuple[bool | None, str]:
             [cloudflared, "tunnel", "info", "--output", "json", tunnel_name],
             capture_output=True,
             text=True,
-            timeout=15
+            timeout=15,
+            creationflags=_windows_creationflags(),
         )
 
         if result.returncode == 0:
@@ -269,7 +330,8 @@ def check_tunnel_process(tunnel_name: str) -> bool:
         result = subprocess.run(
             ["pgrep", "-f", f"tunnel.*run.*{tunnel_name}"],
             capture_output=True,
-            timeout=5
+            timeout=5,
+            creationflags=_windows_creationflags(),
         )
 
         if result.returncode == 0:
@@ -293,7 +355,8 @@ def _check_connection_freshness(tunnel_name: str, max_age_seconds: int = 600) ->
             [cloudflared, "tunnel", "info", "--output", "json", tunnel_name],
             capture_output=True,
             text=True,
-            timeout=10
+            timeout=10,
+            creationflags=_windows_creationflags(),
         )
 
         if result.returncode != 0:
@@ -368,7 +431,7 @@ def comprehensive_health_check(tunnel_name: str) -> bool:
         return False
 
     # 2. 检查metrics端点
-    metrics_status = check_metrics_endpoint()
+    metrics_status = check_metrics_endpoint(tunnel_name)
     if not metrics_status["ready"]:
         log("WARNING", f"Metrics端点不健康: {metrics_status['status']}")
         # Metrics 端点失败可能只是暂时的，记录但继续检查其他项
@@ -391,188 +454,90 @@ def comprehensive_health_check(tunnel_name: str) -> bool:
 
     return True
 
-def start_tunnel(tunnel_name: str) -> subprocess.Popen:
-    """启动隧道"""
+def start_tunnel(tunnel_name: str) -> subprocess.Popen | None:
+    """启动隧道。"""
     global cloudflared_process
 
     config_path = get_tunnel_config_path(tunnel_name)
-
     if not config_path.exists():
         log("ERROR", f"配置文件不存在: {config_path}")
         return None
 
-    try:
-        # 设置环境变量
-        env = os.environ.copy()
-        # 增加UDP缓冲区大小
-        env['QUIC_GO_UDP_RECEIVE_BUFFER_SIZE'] = '7340032'  # 7MB
-
-        log("INFO", f"正在启动隧道 {tunnel_name}...")
-
-        # 构建启动命令，添加更多参数
-        cloudflared = get_cloudflared_path()
-        metrics_port = _current_metrics_port(tunnel_name)
-        protocol = get_tunnel_protocol(tunnel_name)
-        log("INFO", f"启动协议: {protocol}")
-        cmd = [
-            cloudflared,
-            "--config", str(config_path),
-            "--metrics", f"localhost:{metrics_port}",
-            "--protocol", protocol,
-            "tunnel", "run",
-            tunnel_name
-        ]
-
-        # 创建日志文件
-        log_dir = Path(__file__).parent.parent / "logs" / "persistent"
-        log_dir.mkdir(parents=True, exist_ok=True)
-        tunnel_log = log_dir / f"cloudflared_{tunnel_name}.log"
-
-        with open(tunnel_log, 'a') as log_file:
-            cloudflared_process = subprocess.Popen(
-                cmd,
-                stdout=log_file,
-                stderr=subprocess.STDOUT,
-                env=env,
-                preexec_fn=os.setsid if os.name != 'nt' else None
-            )
-
-        # 等待隧道完全启动 - 简化验证逻辑，只检查进程是否运行
-        log("INFO", "等待隧道启动...")
-        startup_timeout = 60  # 最多等待60秒
-        for i in range(startup_timeout):
-            time.sleep(1)
-
-            # 检查进程是否仍在运行
-            if cloudflared_process.poll() is not None:
-                log("ERROR", f"隧道进程意外退出，退出码: {cloudflared_process.returncode}")
-                return None
-
-            # 仅在前30秒内尝试验证连接（不要让启动卡住）
-            if i >= 5 and i % 5 == 0 and i <= 30:
-                try:
-                    # 尝试检查 metrics 端点
-                    metrics_status = check_metrics_endpoint()
-                    if metrics_status["ready"]:
-                        log("INFO", f"隧道 {tunnel_name} Metrics端点已可用，PID: {cloudflared_process.pid}")
-                        return cloudflared_process
-                except Exception as e:
-                    log("DEBUG", f"Metrics检查异常: {e}")
-
-        # 如果60秒后进程仍在运行，则认为启动成功
-        log("INFO", f"隧道 {tunnel_name} 进程启动成功，PID: {cloudflared_process.pid}（监控脚本将在后续检查连接状态）")
-        return cloudflared_process
-
-    except Exception as e:
-        log("ERROR", f"启动隧道失败: {e}")
+    service = _require_lifecycle_service()
+    validation = service.normalize_and_validate_config(config_path)
+    _log_config_warnings(validation)
+    if not validation.get("ok"):
+        log("ERROR", f"配置校验失败: {validation.get('error')}")
         return None
 
+    cloudflared_path = get_cloudflared_path()
+    tunnel_log = _persistent_tunnel_log_path(tunnel_name)
+
+    try:
+        log("INFO", f"正在启动隧道 {tunnel_name}...")
+        result = service.launch_tunnel(
+            cloudflared_path,
+            tunnel_name,
+            config_path,
+            capture_output=False,
+            log_file=tunnel_log,
+            health_timeout=STARTUP_HEALTH_TIMEOUT,
+            max_wait_seconds=STARTUP_WAIT_SECONDS,
+            metrics_address=_metrics_address(tunnel_name),
+            env_overrides={"QUIC_GO_UDP_RECEIVE_BUFFER_SIZE": UDP_BUFFER_SIZE},
+        )
+    except Exception as exc:
+        log("ERROR", f"启动隧道失败: {exc}")
+        return None
+
+    if not result.get("ok"):
+        log("ERROR", f"启动隧道失败: {result.get('error', '未知错误')}")
+        return None
+
+    proc = result.get("proc")
+    if not proc:
+        log("ERROR", "启动结果缺少进程句柄")
+        return None
+
+    cloudflared_process = proc
+    protocol = result.get("protocol", "默认")
+    detail = str(result.get("detail") or "").strip()
+    log("INFO", f"隧道 {tunnel_name} 启动成功（协议: {protocol}，PID: {proc.pid}）")
+
+    metrics_status = check_metrics_endpoint(tunnel_name)
+    if metrics_status["ready"]:
+        log("INFO", f"隧道 {tunnel_name} Metrics端点已可用，端口: {_current_metrics_port(tunnel_name)}")
+    elif detail:
+        log("INFO", f"启动检查: {detail}")
+
+    return proc
+
+
 def stop_tunnel(tunnel_name: str = None):
-    """停止隧道"""
+    """停止隧道。"""
     global cloudflared_process
 
-    # 如果没有指定隧道名，使用默认值
-    target_tunnel = tunnel_name or TUNNEL_NAME
+    target_tunnel = tunnel_name or current_tunnel_name or TUNNEL_NAME
+    managed_proc = cloudflared_process
+    cloudflared_process = None
 
-    if cloudflared_process:
-        try:
-            log("INFO", "正在停止隧道...")
+    if managed_proc is None and not check_tunnel_process(target_tunnel):
+        return
 
-            # 发送 SIGTERM 信号优雅关闭
-            if os.name != 'nt':
-                # ✓ 安全地获取进程组，避免 PID 重用导致误杀其他进程
-                pgid = None
-                try:
-                    pgid = os.getpgid(cloudflared_process.pid)
-                except (ProcessLookupError, OSError):
-                    pgid = None
+    service = _require_lifecycle_service()
+    log("INFO", f"正在停止隧道 {target_tunnel}...")
+    result = service.stop_tunnel(target_tunnel, managed_proc)
 
-                if pgid is not None:
-                    try:
-                        os.killpg(pgid, signal.SIGTERM)
-                    except (ProcessLookupError, OSError):
-                        log("DEBUG", "进程已退出，尝试直接杀死")
-                        try:
-                            cloudflared_process.terminate()
-                        except ProcessLookupError:
-                            pass
-                else:
-                    # 降级：直接发送信号而不是杀死进程组
-                    try:
-                        cloudflared_process.terminate()
-                    except ProcessLookupError:
-                        pass
-            else:
-                cloudflared_process.terminate()
-
-            # 等待进程结束
-            cloudflared_process.wait(timeout=30)
-            log("INFO", "隧道已停止")
-
-        except subprocess.TimeoutExpired:
-            log("WARNING", "隧道停止超时，强制终止")
-            if os.name != 'nt':
-                # ✓ 强制杀死前再次安全检查
-                pgid = None
-                try:
-                    pgid = os.getpgid(cloudflared_process.pid)
-                except (ProcessLookupError, OSError):
-                    pgid = None
-
-                if pgid is not None:
-                    try:
-                        os.killpg(pgid, signal.SIGKILL)
-                    except (ProcessLookupError, OSError):
-                        try:
-                            cloudflared_process.kill()
-                        except ProcessLookupError:
-                            pass
-                else:
-                    try:
-                        cloudflared_process.kill()
-                    except ProcessLookupError:
-                        pass
-            else:
-                cloudflared_process.kill()
-            cloudflared_process.wait(timeout=5)
-        except Exception as e:
-            log("ERROR", f"停止隧道失败: {e}")
-        finally:
-            cloudflared_process = None
-
-    # 额外清理：仅终止命令行中明确包含 "tunnel run <name>" 的残留进程，避免前缀误杀
-    if os.name == "nt":
-        try:
-            if cf:
-                cf.kill_tunnel_by_name(target_tunnel)
-        except Exception as e:
-            log("DEBUG", f"清理残留进程失败: {e}")
+    if result.get("ok"):
+        if result.get("method") == "proc":
+            log("INFO", f"隧道 {target_tunnel} 已停止，PID: {result.get('pid')}")
+        else:
+            log("INFO", result.get("message") or f"隧道 {target_tunnel} 已停止")
     else:
-        try:
-            ps = subprocess.run(
-                ["ps", "-eo", "pid,command"],
-                capture_output=True,
-                text=True,
-                timeout=5
-            )
-            if ps.returncode == 0:
-                pattern = re.compile(rf"\btunnel\s+run\s+{re.escape(target_tunnel)}(\s|$)")
-                for line in ps.stdout.splitlines():
-                    parts = line.strip().split(None, 1)
-                    if len(parts) != 2:
-                        continue
-                    pid_str, cmd = parts
-                    if not pattern.search(cmd):
-                        continue
-                    try:
-                        pid = int(pid_str)
-                        if pid == os.getpid():
-                            continue
-                        os.kill(pid, signal.SIGTERM)
-                    except Exception:
-                        continue
-        except Exception as e:
-            log("DEBUG", f"清理残留进程失败: {e}")
+        detail = result.get("error") or result.get("message") or "未知错误"
+        log("ERROR", f"停止隧道失败: {detail}")
+
+    _cleanup_residual_tunnel(target_tunnel)
 
 def restart_tunnel_with_backoff(tunnel_name: str, attempt: int = 0) -> bool:
     """带指数退避的重启隧道"""
@@ -590,6 +555,7 @@ def restart_tunnel_with_backoff(tunnel_name: str, attempt: int = 0) -> bool:
             if not check_tunnel_process(tunnel_name):
                 break
             time.sleep(1)
+        _cleanup_residual_tunnel(tunnel_name)
 
     # 检查重启冷却时间
     current_time = time.time()
@@ -624,7 +590,10 @@ def restart_tunnel_with_backoff(tunnel_name: str, attempt: int = 0) -> bool:
 
 def monitor_tunnel(tunnel_name: str):
     """监控隧道主循环"""
-    global running, consecutive_failures
+    global running, consecutive_failures, current_tunnel_name, METRICS_PORT
+
+    current_tunnel_name = tunnel_name
+    METRICS_PORT = get_metrics_port(tunnel_name)
 
     log("INFO", f"开始监控隧道 {tunnel_name}")
     log("INFO", f"检查间隔: {CHECK_INTERVAL} 秒")

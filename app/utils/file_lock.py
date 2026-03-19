@@ -44,6 +44,7 @@ class FileLock:
                     fcntl.flock(fh.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
                 elif _HAS_MSVCRT:
                     # msvcrt 需要指定长度，取 1 字节占位即可
+                    fh.seek(0)
                     msvcrt.locking(fh.fileno(), msvcrt.LK_NBLCK, 1)
                 # 若无可用锁机制，直接继续（降级为无锁模式）
                 self._fh = fh

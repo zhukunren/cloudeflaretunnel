@@ -30,6 +30,22 @@ def _is_macos():
     return platform.system().lower() == "darwin"
 
 
+def _windows_creationflags() -> int:
+    return 0x08000000 if _is_windows() else 0
+
+
+def _run(cmd: list[str], **kwargs):
+    if _is_windows():
+        kwargs.setdefault("creationflags", _windows_creationflags())
+    return subprocess.run(cmd, **kwargs)
+
+
+def _check_output(cmd: list[str], **kwargs):
+    if _is_windows():
+        kwargs.setdefault("creationflags", _windows_creationflags())
+    return subprocess.check_output(cmd, **kwargs)
+
+
 def _shell_split(cmd: str):
     if _is_windows():
         return cmd
@@ -97,7 +113,7 @@ def version(cloudflared_path: str) -> str | None:
     except CloudflaredBinaryError:
         return None
     try:
-        out = subprocess.check_output([binary, "--version"], text=True, encoding="utf-8")
+        out = _check_output([binary, "--version"], text=True, encoding="utf-8")
         return out.strip()
     except Exception:
         return None
@@ -105,7 +121,7 @@ def version(cloudflared_path: str) -> str | None:
 
 def login(cloudflared_path: str) -> subprocess.Popen:
     binary = _ensure_binary(cloudflared_path)
-    creationflags = 0x08000000 if _is_windows() else 0
+    creationflags = _windows_creationflags()
     return subprocess.Popen([binary, "login"], creationflags=creationflags)
 
 
@@ -122,7 +138,7 @@ def list_tunnels(
     binary = _ensure_binary(cloudflared_path)
     error_msg = None
     try:
-        out = subprocess.check_output(
+        out = _check_output(
             [binary, "tunnel", "list", "--output", "json"],
             text=True,
             encoding="utf-8",
@@ -143,7 +159,7 @@ def list_tunnels(
             error_msg = str(exc)
 
         try:
-            out = subprocess.check_output(
+            out = _check_output(
                 [binary, "tunnel", "list"],
                 text=True,
                 encoding="utf-8",
@@ -240,8 +256,13 @@ def create_tunnel(cloudflared_path: str, name: str, origin_cert: str | os.PathLi
     env = os.environ.copy()
     env["TUNNEL_ORIGIN_CERT"] = str(cert_path)
     try:
-        out = subprocess.check_output([binary, "tunnel", "create", name],
-                                      stderr=subprocess.STDOUT, text=True, encoding="utf-8", env=env)
+        out = _check_output(
+            [binary, "tunnel", "create", name],
+            stderr=subprocess.STDOUT,
+            text=True,
+            encoding="utf-8",
+            env=env,
+        )
         return True, out
     except subprocess.CalledProcessError as e:
         output = e.output or ""
@@ -259,8 +280,12 @@ def delete_tunnel(cloudflared_path: str, name: str) -> tuple[bool, str]:
     except CloudflaredBinaryError as e:
         return False, str(e)
     try:
-        out = subprocess.check_output([binary, "tunnel", "delete", "-f", name],
-                                       stderr=subprocess.STDOUT, text=True, encoding="utf-8")
+        out = _check_output(
+            [binary, "tunnel", "delete", "-f", name],
+            stderr=subprocess.STDOUT,
+            text=True,
+            encoding="utf-8",
+        )
         return True, out
     except subprocess.CalledProcessError as e:
         return False, e.output
@@ -272,8 +297,12 @@ def route_dns(cloudflared_path: str, tunnel: str, hostname: str) -> tuple[bool, 
     except CloudflaredBinaryError as e:
         return False, str(e)
     try:
-        out = subprocess.check_output([binary, "tunnel", "route", "dns", tunnel, hostname],
-                                       stderr=subprocess.STDOUT, text=True, encoding="utf-8")
+        out = _check_output(
+            [binary, "tunnel", "route", "dns", tunnel, hostname],
+            stderr=subprocess.STDOUT,
+            text=True,
+            encoding="utf-8",
+        )
         return True, out
     except subprocess.CalledProcessError as e:
         return False, e.output
@@ -611,6 +640,110 @@ def write_basic_config(config_path: Path, tunnel_name: str, tunnel_id: str, serv
     config_path.write_text("\n".join(lines), encoding="utf-8")
 
 
+def _validate_ingress_hostname(hostname: str) -> str | None:
+    """Return an error message when an ingress hostname is invalid."""
+    host = str(hostname).strip()
+    if not host:
+        return "hostname 不能为空"
+    if "://" in host:
+        return f"hostname 不能包含协议，请改成裸域名: {host}"
+    if "/" in host:
+        return f"hostname 不能包含路径，请改成裸域名: {host}"
+
+    bare_host = host[:-1] if host.endswith(".") else host
+    if not bare_host or bare_host.startswith(".") or ".." in bare_host:
+        return f"hostname 格式无效: {host}"
+    return None
+
+
+def validate_ingress_hostname(hostname: str) -> str | None:
+    """Validate a hostname used in ingress or DNS route commands."""
+    return _validate_ingress_hostname(hostname)
+
+
+def _extract_hostnames_from_text(content: str) -> list[str]:
+    """Fallback parser for hostname lines when YAML is unavailable or invalid."""
+    hostnames: list[str] = []
+    for line in content.splitlines():
+        if "hostname:" not in line:
+            continue
+        part = line.split("hostname:", 1)[1].strip()
+        if part:
+            hostnames.append(part.split()[0])
+    return hostnames
+
+
+def extract_hostnames(config_path: Path) -> list[str]:
+    """Read ingress hostnames from a config file without mutating the original values."""
+    if not config_path.exists():
+        return []
+
+    try:
+        content = config_path.read_text(encoding="utf-8")
+    except Exception:
+        return []
+
+    try:
+        import yaml
+        data = yaml.safe_load(content)
+        ingress = data.get("ingress", []) if isinstance(data, dict) else []
+        if isinstance(ingress, list):
+            hostnames = [
+                str(rule.get("hostname")).strip()
+                for rule in ingress
+                if isinstance(rule, dict) and rule.get("hostname")
+            ]
+            if hostnames:
+                return hostnames
+    except Exception:
+        pass
+
+    return _extract_hostnames_from_text(content)
+
+
+def _extract_http_services_from_text(content: str) -> list[str]:
+    """Fallback parser for HTTP/HTTPS service lines when YAML is unavailable or invalid."""
+    services: list[str] = []
+    for line in content.splitlines():
+        if "service:" not in line:
+            continue
+        part = line.split("service:", 1)[1].strip()
+        if part.startswith(("http://", "https://")):
+            services.append(part.split()[0])
+    return services
+
+
+def extract_http_services(config_path: Path) -> list[str]:
+    """Read HTTP/HTTPS ingress services from a config file without mutating the original values."""
+    if not config_path.exists():
+        return []
+
+    try:
+        content = config_path.read_text(encoding="utf-8")
+    except Exception:
+        return []
+
+    try:
+        import yaml
+
+        data = yaml.safe_load(content)
+        ingress = data.get("ingress", []) if isinstance(data, dict) else []
+        if isinstance(ingress, list):
+            services = [
+                str(rule.get("service")).strip()
+                for rule in ingress
+                if isinstance(rule, dict)
+                and isinstance(rule.get("service"), str)
+                and str(rule.get("service")).strip().startswith(("http://", "https://"))
+            ]
+            if services:
+                return services
+    except Exception:
+        pass
+
+    return _extract_http_services_from_text(content)
+
+
 _LOCAL_SERVICE_HOSTS = {
     "localhost",
     "127.0.0.1",
@@ -784,7 +917,7 @@ def tunnel_token(cloudflared_path: str, tunnel_name: str, timeout: int = 20) -> 
     """获取 tunnel token（不会在异常信息中泄露 token）"""
     binary = _ensure_binary(cloudflared_path)
     try:
-        out = subprocess.check_output(
+        out = _check_output(
             [binary, "tunnel", "token", tunnel_name],
             stderr=subprocess.STDOUT,
             text=True,
@@ -903,9 +1036,16 @@ def get_config_protocol(config_path: Path) -> str | None:
     return None
 
 
-def run_tunnel(cloudflared_path: str, name: str, config_path: Path,
-               capture_output: bool = True, log_file: Path | None = None,
-               protocol: str | None = None) -> subprocess.Popen:
+def run_tunnel(
+    cloudflared_path: str,
+    name: str,
+    config_path: Path,
+    capture_output: bool = True,
+    log_file: Path | None = None,
+    protocol: str | None = None,
+    metrics_address: str | None = None,
+    env_overrides: dict[str, str] | None = None,
+) -> subprocess.Popen:
     binary = _ensure_binary(cloudflared_path)
 
     env: dict[str, str] | None = None
@@ -939,7 +1079,14 @@ def run_tunnel(cloudflared_path: str, name: str, config_path: Path,
         if credentials_override and (not config_cred_path or config_cred_path != credentials_override):
             update_config_credentials_file(config_path, credentials_override)
 
+    if env_overrides:
+        if env is None:
+            env = os.environ.copy()
+        env.update({str(key): str(value) for key, value in env_overrides.items()})
+
     cmd = [binary, "--config", str(config_path)]
+    if metrics_address:
+        cmd.extend(["--metrics", metrics_address])
     if protocol:
         cmd.extend(["--protocol", protocol])
     cmd.extend(["tunnel", "run"])
@@ -962,7 +1109,7 @@ def stop_process(proc: subprocess.Popen, timeout: float = 5.0) -> None:
 
     try:
         if _is_windows():
-            subprocess.run(
+            _run(
                 ["taskkill", "/PID", str(proc.pid), "/F", "/T"],
                 stdout=subprocess.DEVNULL,
                 stderr=subprocess.DEVNULL,
@@ -1097,7 +1244,7 @@ def _windows_cloudflared_processes() -> list[tuple[int, str]]:
                 "ProcessId,CommandLine",
                 "/format:csv",
             ]
-            result = subprocess.run(
+            result = _run(
                 cmd,
                 capture_output=True,
                 text=True,
@@ -1125,7 +1272,7 @@ def _windows_cloudflared_processes() -> list[tuple[int, str]]:
                 "| Select-Object ProcessId,CommandLine; "
                 "$items | ConvertTo-Json -Compress"
             )
-            result = subprocess.run(
+            result = _run(
                 ["powershell", "-NoProfile", "-Command", ps_script],
                 capture_output=True,
                 text=True,
@@ -1270,7 +1417,7 @@ def kill_tunnel_by_name(tunnel_name: str) -> tuple[bool, str]:
         if _is_windows():
             for pid in pids:
                 try:
-                    subprocess.run(['taskkill', '/PID', str(pid), '/F'], check=True)
+                    _run(["taskkill", "/PID", str(pid), "/F"], check=True)
                 except Exception as e:
                     errors.append(f"PID {pid}: {e}")
             ok = not errors
@@ -1419,7 +1566,7 @@ def test_connection(cloudflared_path: str, tunnel_name: str, timeout: int = 10) 
         return False, detail or "隧道信息不完整"
 
     try:
-        json_output = subprocess.check_output(
+        json_output = _check_output(
             [binary, "tunnel", "info", "--output", "json", tunnel_name],
             stderr=subprocess.STDOUT,
             text=True,
@@ -1429,7 +1576,7 @@ def test_connection(cloudflared_path: str, tunnel_name: str, timeout: int = 10) 
         data = json.loads(json_output)
         active, summary = _format_json_summary(data if isinstance(data, dict) else {})
         try:
-            text_output = subprocess.check_output(
+            text_output = _check_output(
                 [binary, "tunnel", "info", tunnel_name],
                 stderr=subprocess.STDOUT,
                 text=True,
@@ -1464,7 +1611,7 @@ def test_connection(cloudflared_path: str, tunnel_name: str, timeout: int = 10) 
 
     try:
         if text_output is None:
-            text_output = subprocess.check_output(
+            text_output = _check_output(
                 [binary, "tunnel", "info", tunnel_name],
                 stderr=subprocess.STDOUT,
                 text=True,
@@ -1544,6 +1691,11 @@ def validate_config(config_path: Path) -> tuple[bool, str]:
             if "service:" not in content:
                 return False, "配置缺少ingress服务规则"
 
+            for ingress_idx, host in enumerate(_extract_hostnames_from_text(content), start=1):
+                error = _validate_ingress_hostname(host)
+                if error:
+                    return False, f"第 {ingress_idx} 条 ingress 的 {error}"
+
             return True, "配置文件格式正确"
         except Exception as e:
             return False, f"读取配置文件失败: {str(e)}"
@@ -1566,6 +1718,17 @@ def validate_config(config_path: Path) -> tuple[bool, str]:
         ingress = config['ingress']
         if not isinstance(ingress, list) or len(ingress) == 0:
             return False, "ingress 必须是非空列表"
+
+        for idx, rule in enumerate(ingress, start=1):
+            if not isinstance(rule, dict):
+                continue
+            hostname = rule.get("hostname")
+            if not hostname:
+                continue
+
+            error = _validate_ingress_hostname(str(hostname))
+            if error:
+                return False, f"第 {idx} 条 ingress 的 {error}"
 
         # 检查最后一个规则是否是默认规则
         last_rule = ingress[-1]

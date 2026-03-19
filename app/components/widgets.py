@@ -23,7 +23,7 @@ class ModernButton(tk.Button):
         self.icon = icon
 
         # 组合图标和文字
-        display_text = f"{icon} {text}" if icon else text
+        display_text = Theme.ui_text(f"{icon} {text}" if icon else text)
 
         # 根据样式类型设置颜色
         colors = self._get_colors(style_type)
@@ -103,7 +103,7 @@ class IconButton(tk.Button):
     def __init__(self, parent, icon: str, command=None, tooltip="", size=32, **kwargs):
         super().__init__(
             parent,
-            text=icon,
+            text=Theme.ui_text(icon),
             command=command,
             bg=kwargs.pop("bg", Theme.BG_TOOLBAR),
             fg=kwargs.pop("fg", Theme.TEXT_LIGHT),
@@ -147,7 +147,7 @@ class Card(tk.Frame):
             self.header.pack(fill=tk.X)
             self.header.pack_propagate(False)
 
-            title_text = f"{icon} {title}" if icon else title
+            title_text = Theme.ui_text(f"{icon} {title}" if icon else title)
             tk.Label(
                 self.header,
                 text=title_text,
@@ -179,7 +179,7 @@ class Badge(tk.Label):
         }
 
         bg_color, fg_color = color_schemes.get(status, color_schemes["default"])
-        display_text = f"{icon} {text}" if icon else text
+        display_text = Theme.ui_text(f"{icon} {text}" if icon else text)
 
         super().__init__(
             parent,
@@ -221,7 +221,7 @@ class StatusIndicator(tk.Frame):
         if icon:
             tk.Label(
                 content,
-                text=icon,
+                text=Theme.ui_text(icon),
                 bg=bg_color,
                 fg=fg_color,
                 font=(Theme.FONT_FAMILY, Theme.FONT_SIZE_BASE)
@@ -267,7 +267,7 @@ class SearchBox(tk.Frame):
         # 搜索图标
         tk.Label(
             self,
-            text="🔍",
+            text=Theme.ui_text("🔍"),
             bg=Theme.BG_CARD,
             fg=Theme.TEXT_MUTED,
             font=(Theme.FONT_FAMILY, Theme.FONT_SIZE_BASE)

@@ -7,16 +7,16 @@
 - 🎨 现代化图形界面管理
 - 🔄 自动重连机制（监控服务）
 - 📊 实时状态监控
-- 🚀 开机自启动（Systemd）
+- 🚀 开机自启动（Windows 注册表 / Linux Systemd）
 - 📝 详细日志记录
 - 🌐 DNS 路由管理
 - 🔧 隧道诊断工具
 
 ## 环境要求
-- Linux/Unix 系统（推荐 Ubuntu 20.04+）
-- Python 3.8+（包含 Tkinter）
+- **Windows 10/11** 或 **Linux/Unix 系统**（推荐 Ubuntu 20.04+）
+- Python 3.8+（Windows 需包含 Tkinter）
 - Cloudflared CLI 工具
-- Systemd（用于服务管理）
+- Linux: Systemd（用于服务管理）
 
 ## 安装 cloudflared
 1) 访问 https://developers.cloudflare.com/cloudflare-one/connections/connect-networks/downloads/ 下载对应平台版本
@@ -26,21 +26,54 @@
 
 ### 1. 启动 GUI 管理界面
 ```bash
-cd app
-python3 main.py
-# 或
-python3 app/main.py
+# 从项目根目录运行（推荐）
+python -m app.main
+
+# 经典 UI
+python -m app.main --classic
+
+# Windows: 双击 run.bat 或
+run.bat
+
+# Windows 调试模式（显示控制台输出；`--console` 必须放在第一个参数）
+run.bat --console
 ```
 
-### 2. 安装自动监控服务（推荐）
+### 2. Windows 开机自启动配置
+
+```bat
+:: 推荐：后台守护多隧道（按 config/tunnels.json 的 auto_start 启动）
+scripts\windows\setup_autostart.bat install supervisor
+
+:: 或：登录后自动打开 GUI（配合 GUI 内"自动启动"设置自动拉起隧道）
+scripts\windows\setup_autostart.bat install gui
+
+:: 查看状态
+scripts\windows\setup_autostart.bat status supervisor
+
+:: 卸载自启动
+scripts\windows\setup_autostart.bat uninstall supervisor
+```
+
+**配置说明**：
+- 自启动使用 Windows 注册表 (HKCU\Run)，兼容性最好
+- 守护进程会根据 `config/tunnels.json` 中 `auto_start: true` 的隧道自动启动
+- 使用 `pythonw.exe` 运行，无控制台窗口；已对 cloudflared 等子进程启用无窗口运行，避免频繁弹窗/闪退
+- 排错：查看 `logs/tunnel_supervisor.log`，或用 `run.bat --console` 前台运行观察报错
+
+### 3. Linux 自动监控服务
 ```bash
 # 需要 root 权限
-sudo scripts/systemd/setup_service.sh install
+sudo ./scripts/deploy_improved_monitor.sh
 ```
 
-### 3. 检查服务状态
+### 4. 检查服务状态
 ```bash
+# Linux
 scripts/utils/check_status.sh
+
+# Windows (PowerShell)
+scripts\windows\setup_autostart.bat status supervisor
 ```
 
 ## 目录结构
@@ -50,19 +83,19 @@ scripts/utils/check_status.sh
 │   ├── cloudflared_cli.py   # Cloudflared CLI 封装
 │   ├── diagnose.py          # 诊断工具
 │   ├── modern_gui.py        # 现代化 GUI 界面
-│   ├── tunnel_monitor.py    # 旧版监控脚本（兼容保留）
+│   ├── tunnel_monitor_improved.py # 改进版单隧道监控脚本
 │   ├── tunnel_supervisor.py # 多隧道守护进程
 │   └── main.py              # 主程序入口
 ├── scripts/                  # 脚本工具
 │   ├── systemd/             # Systemd 服务相关
-│   │   ├── cloudflared-monitor.service   # 旧版监控 Service（已弃用）
-│   │   ├── tunnel-supervisor.service     # 新 Supervisor Service
-│   │   └── setup_service.sh              # 旧版安装脚本
+│   │   └── tunnel-supervisor.service     # Supervisor Service
+│   ├── deploy_improved_monitor.sh # 一键部署改单隧道监控服务
 │   ├── deploy_supervisor.sh   # 一键部署 Supervisor
 │   └── check_tunnel_status.sh # Supervisor 版状态巡检脚本
 ├── tunnels/                 # 隧道配置目录
 │   └── [tunnel_name]/       # 各隧道配置文件夹
 ├── config/                  # 配置文件
+├── docs/                    # 说明文档（排错/总结/指南）
 └── logs/                    # 日志目录
     ├── tunnel_*.log         # 隧道日志
     ├── tunnel_supervisor.log # Supervisor 日志
@@ -132,7 +165,7 @@ tail -f logs/tunnel_*.log
 
 ### 运行诊断
 ```bash
-python3 app/diagnose.py [tunnel_name]
+python -m app.diagnose
 ```
 
 ## 开发说明
