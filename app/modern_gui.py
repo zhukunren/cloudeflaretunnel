@@ -1568,14 +1568,59 @@ class ModernTunnelManager(tk.Tk):
         self._reset_proc_state(tunnel_name, expected_pid=expected_pid)
         self._auto_heal_pending.discard(tunnel_name)
 
+    @staticmethod
+    def _normalize_feedback_text(message: str | None) -> str:
+        return str(message or "").strip()
+
+    def _logger_for_tag(self, tag: str):
+        return {
+            "error": self.logger.error,
+            "warning": self.logger.warning,
+        }.get(tag, self.logger.info)
+
+    def _messagebox_for_level(self, level: str):
+        return {
+            "error": messagebox.showerror,
+            "warning": messagebox.showwarning,
+        }.get(level, messagebox.showinfo)
+
+    def _record_feedback(self, message: str | None, tag: str = "info"):
+        """统一写入日志窗口和结构化 logger。"""
+        text = self._normalize_feedback_text(message)
+        if not text:
+            return
+        self._append_log(text + "\n", tag)
+        self._logger_for_tag(tag)(text)
+
+    def _record_feedback_lines(self, messages, tag: str = "info"):
+        for message in messages or []:
+            self._record_feedback(message, tag)
+
+    def _notify_feedback(
+        self,
+        title: str,
+        message: str | None,
+        *,
+        tag: str = "info",
+        status: str | None = None,
+        log_message: str | None = None,
+        dialog_level: str | None = None,
+    ):
+        """统一处理状态栏、日志和弹窗。"""
+        if status is not None:
+            self.status_var.set(status)
+
+        logged = log_message if log_message is not None else message
+        self._record_feedback(logged, tag)
+
+        text = self._normalize_feedback_text(message)
+        if text:
+            self._messagebox_for_level(dialog_level or tag)(title, text)
+
     def _log_result_messages(self, result: dict):
         """将后台任务返回的消息和警告统一写入日志。"""
-        for msg in result.get("messages", []) or []:
-            self._append_log(msg + "\n", "info")
-            self.logger.info(msg)
-        for msg in result.get("warnings", []) or []:
-            self._append_log(msg + "\n", "warning")
-            self.logger.warning(msg)
+        self._record_feedback_lines(result.get("messages", []), "info")
+        self._record_feedback_lines(result.get("warnings", []), "warning")
 
     def _new_start_result(self, tunnel_name: str, managed_by: str, **overrides) -> dict:
         """创建统一的启动结果对象，避免 direct/supervisor 各自返回不同结构。"""
@@ -1796,7 +1841,7 @@ class ModernTunnelManager(tk.Tk):
 
         if result.get("managed_by") == "supervisor":
             msg = self._supervisor_payload_message(result, "启动指令已发送")
-            self._append_log(f"守护进程应答: {msg or '启动指令已发送'}\n", "success")
+            self._record_feedback(f"守护进程应答: {msg or '启动指令已发送'}", "success")
             self.logger.info(f"守护进程启动 {tunnel_name}: {msg}")
             self.status_var.set("启动指令已发送")
             self._refresh_proc_state()
@@ -1814,31 +1859,43 @@ class ModernTunnelManager(tk.Tk):
         err = result.get("error") or result.get("message") or result.get("detail") or "未知错误"
         if result.get("managed_by") == "supervisor":
             self._append_supervisor_payload_logs(result)
-            self.status_var.set("启动失败")
-            self._append_log(f"守护进程启动失败: {err}\n", "error")
-            self.logger.error(f"守护进程启动 {tunnel_name} 失败: {err}")
-            messagebox.showerror("守护进程启动失败", err)
+            self._notify_feedback(
+                "守护进程启动失败",
+                err,
+                tag="error",
+                status="启动失败",
+                log_message=f"守护进程启动失败: {err}",
+            )
             return True
 
         if stage == "dns":
             hostname = result.get("hostname") or ""
-            self.status_var.set("DNS 路由失败")
-            self._append_log(f"DNS 路由失败: {err}\n", "error")
-            self.logger.error(f"DNS 路由失败: {hostname} - {err}")
-            messagebox.showerror("DNS 路由失败", f"{hostname} 配置失败：\n{err}")
+            self._notify_feedback(
+                "DNS 路由失败",
+                f"{hostname} 配置失败：\n{err}",
+                tag="error",
+                status="DNS 路由失败",
+                log_message=f"DNS 路由失败: {hostname} - {err}",
+            )
             return True
 
         if stage == "config":
-            self.status_var.set("启动失败")
-            self._append_log(f"配置处理失败: {err}\n", "error")
-            self.logger.error(f"配置处理失败: {err}")
-            messagebox.showerror("启动失败", f"配置处理失败：\n{err}")
+            self._notify_feedback(
+                "启动失败",
+                f"配置处理失败：\n{err}",
+                tag="error",
+                status="启动失败",
+                log_message=f"配置处理失败: {err}",
+            )
             return True
 
-        self.status_var.set("隧道启动失败")
-        self._append_log(f"隧道 {tunnel_name} 启动失败：{err}\n", "error")
-        self.logger.error(f"隧道 {tunnel_name} 启动失败：{err}")
-        messagebox.showerror("启动失败", f"未检测到活跃连接，隧道启动失败。\n{err}")
+        self._notify_feedback(
+            "启动失败",
+            f"未检测到活跃连接，隧道启动失败。\n{err}",
+            tag="error",
+            status="隧道启动失败",
+            log_message=f"隧道 {tunnel_name} 启动失败：{err}",
+        )
         return True
 
     def _finish_start_selected(self, tunnel_name: str, result: dict):
@@ -1854,8 +1911,7 @@ class ModernTunnelManager(tk.Tk):
                 return
 
             self.status_var.set("隧道启动失败")
-            self._append_log(f"隧道 {tunnel_name} 启动失败：未获得进程句柄\n", "error")
-            self.logger.error(f"隧道 {tunnel_name} 启动失败：未获得进程句柄")
+            self._record_feedback(f"隧道 {tunnel_name} 启动失败：未获得进程句柄", "error")
         finally:
             self._unlock_tunnel_operation()
 
@@ -1864,8 +1920,7 @@ class ModernTunnelManager(tk.Tk):
         self._auto_heal_pending.discard(tunnel_name)
         if not result.get("ok"):
             err = result.get("error", "自动重连失败")
-            self._append_log(f"自动重连失败：{err}\n", "error")
-            self.logger.error(f"自动重连失败：{err}")
+            self._record_feedback(f"自动重连失败：{err}", "error")
             self.status_var.set("自动重连失败")
             return
 
@@ -1879,8 +1934,7 @@ class ModernTunnelManager(tk.Tk):
         ):
             return
 
-        self._append_log(f"自动重连失败：未获得进程句柄\n", "error")
-        self.logger.error("自动重连失败：未获得进程句柄")
+        self._record_feedback("自动重连失败：未获得进程句柄", "error")
         self.status_var.set("自动重连失败")
 
     def _restart_gui_tunnel(self, tunnel_name: str, cloudflared_path: str | None = None, persist_enabled: bool | None = None):
@@ -1891,8 +1945,7 @@ class ModernTunnelManager(tk.Tk):
 
         path = cloudflared_path or self.runtime_service.resolve_cloudflared_path(self.cloudflared_path.get().strip())
         if not path:
-            self._append_log("自动重连失败：未设置 cloudflared 路径\n", "error")
-            self.logger.error("自动重连失败：未设置 cloudflared 路径")
+            self._record_feedback("自动重连失败：未设置 cloudflared 路径", "error")
             self._auto_heal_pending.discard(tunnel_name)
             return
 
@@ -2434,20 +2487,18 @@ class ModernTunnelManager(tk.Tk):
                     self.cloudflared_path.set(str(result.target_path))
                     self.settings.set("cloudflared.path", str(result.target_path))
                     self._refresh_version()
-                    self._append_log(f"{result.message}{extra}\n", "success")
-                    self.logger.info(f"{result.message}{extra}")
+                    self._record_feedback(f"{result.message}{extra}", "success")
                     dialog = messagebox.showinfo if cert_ok else messagebox.showwarning
                     title = success_label if cert_ok else f"{success_label}（需登录）"
                     dialog(title, result.message + extra + cert_append)
                     tag = "success" if cert_ok else "warning"
-                    self._append_log(cert_detail + "\n", tag)
+                    self._record_feedback(cert_detail, tag)
                     self.status_var.set(success_label if cert_ok else "缺少认证")
                 else:
-                    self._append_log(f"{result.message}\n", "error")
-                    self.logger.error(result.message)
+                    self._record_feedback(result.message, "error")
                     messagebox.showerror(f"{fail_label}", result.message + cert_append)
                     tag = "success" if cert_ok else "warning"
-                    self._append_log(cert_detail + "\n", tag)
+                    self._record_feedback(cert_detail, tag)
                     self.status_var.set(fail_label)
 
                 self._update_status_display()
@@ -2475,24 +2526,20 @@ class ModernTunnelManager(tk.Tk):
         """删除已有 cert.pem，便于重新触发登录。"""
         ok, msg = self.auth_service.delete_origin_cert(cert_path)
         if ok:
-            self._append_log(msg + "\n", "info")
-            self.logger.info(msg)
+            self._record_feedback(msg, "info")
             return True
-        messagebox.showerror("错误", msg)
-        self.logger.error(msg)
+        self._notify_feedback("错误", msg, tag="error")
         return False
 
     def _start_cloudflare_login(self, cloudflared_path: str) -> bool:
         """启动 Cloudflare 浏览器授权流程。"""
         ok, msg = self.auth_service.start_login(cloudflared_path)
         if not ok:
-            messagebox.showerror("无法登录", msg)
-            self._append_log(f"登录失败: {msg}\n", "error")
-            self.logger.error(f"登录失败: {msg}")
+            self._notify_feedback("无法登录", msg, tag="error", log_message=f"登录失败: {msg}")
             return False
 
         self.status_var.set("已启动登录流程，请在浏览器中完成授权…")
-        self._append_log("正在打开浏览器进行 Cloudflare 授权...\n", "info")
+        self._record_feedback("正在打开浏览器进行 Cloudflare 授权...", "info")
         self.logger.info("已启动 Cloudflare 登录流程")
         self.after(2000, lambda: self.status_var.set("就绪"))
         return True
@@ -2565,17 +2612,12 @@ class ModernTunnelManager(tk.Tk):
 
     def _apply_tunnel_list_result(self, result: TunnelCatalogLoadResult):
         """应用隧道列表刷新结果（必须在主线程调用）"""
-        for msg in result.messages:
-            self._append_log(msg + "\n", "info")
-            self.logger.info(msg)
-        for msg in result.warnings:
-            self._append_log(msg + "\n", "warning")
-            self.logger.warning(msg)
+        self._record_feedback_lines(result.messages, "info")
+        self._record_feedback_lines(result.warnings, "warning")
 
         if not result.ok:
             error_text = result.error or "刷新隧道失败"
-            self._append_log(f"刷新隧道失败: {error_text}\n", "error")
-            self.logger.error(f"刷新隧道失败: {error_text}")
+            self._record_feedback(f"刷新隧道失败: {error_text}", "error")
             self.tunnel_list.set_tunnels([], "加载失败", "无法访问 Cloudflare API，请检查网络/代理或使用本地配置。")
             self.status_var.set("网络不可用")
             return
@@ -2588,8 +2630,7 @@ class ModernTunnelManager(tk.Tk):
             return
 
         self.status_var.set(f"已加载 {len(result.tunnels)} 个隧道")
-        self._append_log(f"已加载 {len(result.tunnels)} 个隧道\n", "success")
-        self.logger.info(f"成功加载 {len(result.tunnels)} 个隧道")
+        self._record_feedback(f"已加载 {len(result.tunnels)} 个隧道", "success")
 
     def _on_tunnel_select(self, tunnel_data):
         """隧道选择事件"""
@@ -2630,21 +2671,16 @@ class ModernTunnelManager(tk.Tk):
         self._append_log(f"正在创建隧道: {name}...\n", "info")
         self.logger.info(f"开始创建隧道: {name}")
         result = self.catalog_service.create_tunnel(path, name, cert)
-        for warning in result.warnings:
-            self._append_log(warning + "\n", "warning")
-            self.logger.warning(warning)
+        self._record_feedback_lines(result.warnings, "warning")
 
         if result.ok:
-            self._append_log(result.message + "\n", "success")
+            self._record_feedback(result.message, "success")
             if result.detail:
-                self._append_log(result.detail + "\n", "info")
-            self.logger.info(result.message)
+                self._record_feedback(result.detail, "info")
             self.refresh_tunnels()
         else:
             error_text = result.error or result.detail or result.message
-            self._append_log(f"创建失败: {error_text}\n", "error")
-            self.logger.error(f"创建隧道失败: {error_text}")
-            messagebox.showerror("创建失败", error_text)
+            self._notify_feedback("创建失败", error_text, tag="error", log_message=f"创建失败: {error_text}")
 
     def _delete_selected(self):
         """删除选中的隧道"""
@@ -2662,21 +2698,16 @@ class ModernTunnelManager(tk.Tk):
         self._append_log(f"正在删除隧道: {name}...\n", "warning")
         self.logger.warning(f"开始删除隧道: {name}")
         result = self.catalog_service.delete_tunnel(path, name)
-        for warning in result.warnings:
-            self._append_log(warning + "\n", "warning")
-            self.logger.warning(warning)
+        self._record_feedback_lines(result.warnings, "warning")
 
         if result.ok:
-            self._append_log(result.message + "\n", "success")
+            self._record_feedback(result.message, "success")
             if result.detail:
-                self._append_log(result.detail + "\n", "info")
-            self.logger.info(result.message)
+                self._record_feedback(result.detail, "info")
             self.refresh_tunnels()
         else:
             error_text = result.error or result.detail or result.message
-            self._append_log(f"删除失败: {error_text}\n", "error")
-            self.logger.error(f"删除隧道失败: {error_text}")
-            messagebox.showerror("删除失败", error_text)
+            self._notify_feedback("删除失败", error_text, tag="error", log_message=f"删除失败: {error_text}")
 
     def _config_path_for(self, tunnel_name: str) -> Path:
         """获取隧道配置文件路径"""
@@ -2938,7 +2969,7 @@ class ModernTunnelManager(tk.Tk):
             self._append_supervisor_payload_logs(result)
 
         if ok:
-            self._append_log(f"守护进程已执行停止指令: {msg}\n", "success")
+            self._record_feedback(f"守护进程已执行停止指令: {msg}", "success")
             self.logger.info(f"守护进程停止 {tunnel_name}: {msg}")
             self.status_var.set("停止指令已发送")
             self._clear_tunnel_runtime_state(tunnel_name)
@@ -2946,9 +2977,12 @@ class ModernTunnelManager(tk.Tk):
             self._immediate_status_sync()
             return True
 
-        self._append_log(f"守护进程停止失败: {msg}\n", "error")
-        self.logger.error(f"守护进程停止 {tunnel_name} 失败: {msg}")
-        messagebox.showerror("停止失败", msg or "守护进程拒绝操作")
+        self._notify_feedback(
+            "停止失败",
+            msg or "守护进程拒绝操作",
+            tag="error",
+            log_message=f"守护进程停止失败: {msg}",
+        )
         return True
 
     def _finish_stop_running(self, tunnel_name: str, result: dict):
@@ -2960,15 +2994,12 @@ class ModernTunnelManager(tk.Tk):
 
             if not result.get("ok"):
                 err = result.get("error") or result.get("message") or "停止失败"
-                self._append_log(f"{err}\n", "error")
-                self.logger.error(err)
-                messagebox.showerror("停止失败", err)
+                self._notify_feedback("停止失败", err, tag="error")
                 return
 
             self._clear_tunnel_runtime_state(tunnel_name, expected_pid=result.get("pid"))
             self.status_var.set("隧道已停止")
-            self._append_log(f"隧道 {tunnel_name} 已停止并取消激活\n", "success")
-            self.logger.info(f"隧道 {tunnel_name} 已停止并取消激活")
+            self._record_feedback(f"隧道 {tunnel_name} 已停止并取消激活", "success")
         finally:
             self._unlock_tunnel_operation()
 
@@ -3137,13 +3168,11 @@ class ModernTunnelManager(tk.Tk):
     def _handle_route_dns_result(self, tunnel_name: str, hostname: str, ok: bool, output: str):
         """统一处理手动 DNS 路由的结果展示。"""
         if ok:
-            self._append_log(f"DNS 路由配置成功: {hostname} -> {tunnel_name}\n", "success")
-            self.logger.info(f"DNS 路由配置成功: {hostname} -> {tunnel_name}")
+            self._record_feedback(f"DNS 路由配置成功: {hostname} -> {tunnel_name}", "success")
             messagebox.showinfo("成功", f"已为 {tunnel_name} 绑定 {hostname}")
             return
 
-        self._append_log(f"DNS 路由失败: {output}\n", "error")
-        self.logger.error(f"DNS 路由失败: {output}")
+        self._record_feedback(f"DNS 路由失败: {output}", "error")
         if "already exists" in output:
             messagebox.showerror(
                 "DNS记录已存在",
