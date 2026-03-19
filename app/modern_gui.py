@@ -25,6 +25,7 @@ try:
         AuthService,
         CloudflaredBinaryService,
         DnsRouteService,
+        TunnelCoordinationService,
         TunnelCatalogLoadResult,
         TunnelCatalogService,
         TunnelConfigService,
@@ -47,6 +48,7 @@ except (ImportError, ValueError):
         AuthService,
         CloudflaredBinaryService,
         DnsRouteService,
+        TunnelCoordinationService,
         TunnelCatalogLoadResult,
         TunnelCatalogService,
         TunnelConfigService,
@@ -494,6 +496,7 @@ class ModernTunnelManager(tk.Tk):
         self._supervisor_active = False
         self.supervisor_client = SupervisorClient(self._project_root)
         self._supervisor_available = self.supervisor_client.is_available()
+        self.coordination_service = TunnelCoordinationService(self.supervisor_lock, self.supervisor_client)
         self.auth_service = AuthService()
         self.config_service = TunnelConfigService()
         self.catalog_service = TunnelCatalogService(self._project_root, self.config_service)
@@ -1071,31 +1074,28 @@ class ModernTunnelManager(tk.Tk):
 
     def _on_autostart_toggle(self):
         """自动启动选项切换"""
-        enabled = bool(self.autostart_var.get())
-        self.settings.set("tunnel.auto_start_enabled", enabled)
-        trigger_now = False
-        if enabled:
-            selected = self.tunnel_list.get_selected() if hasattr(self, "tunnel_list") else None
-            target = (selected.get("name") if selected else None) or self.settings.get("tunnel.last_selected")
-            if target:
-                self._set_autostart_target(target)
-                self._append_log(f"自动启动已启用，将尝试激活隧道: {target}\n", "info")
-                self.logger.info(f"启用自动启动: {target}")
-                trigger_now = True
-            else:
-                self._append_log("自动启动已启用，但尚未指定隧道，请先选择一个隧道。\n", "warning")
-                self.logger.warning("自动启动缺少目标")
-                self._show_dialog("自动启动", "请先选择准备自动启动的隧道，然后再次启用该选项。")
-                self.autostart_var.set(False)
-                self.settings.set("tunnel.auto_start_enabled", False)
-                enabled = False
-        else:
-            self._append_log("已关闭自动启动选项。\n", "info")
-            self.logger.info("关闭自动启动")
-            self._auto_start_done = True
+        selected = self.tunnel_list.get_selected() if hasattr(self, "tunnel_list") else None
+        decision = self.coordination_service.evaluate_autostart_toggle(
+            bool(self.autostart_var.get()),
+            selected_name=selected.get("name") if selected else None,
+            last_selected=self.settings.get("tunnel.last_selected"),
+        )
+
+        self.autostart_var.set(decision.enabled)
+        self.settings.set("tunnel.auto_start_enabled", decision.enabled)
+        self._auto_start_done = decision.auto_start_done
+
+        if decision.target:
+            self._set_autostart_target(decision.target)
+        if decision.ui_message:
+            self._append_log(decision.ui_message + "\n", decision.ui_level)
+        if decision.logger_message:
+            self._logger_for_tag(decision.ui_level)(decision.logger_message)
+        if decision.dialog_message:
+            self._show_dialog(decision.dialog_title or "自动启动", decision.dialog_message)
+
         self._refresh_autostart_hint()
-        if enabled and trigger_now:
-            self._auto_start_done = False
+        if decision.enabled and decision.trigger_now:
             self._auto_start_if_enabled(force=True)
 
     def _on_auto_heal_toggle(self):
@@ -1323,63 +1323,46 @@ class ModernTunnelManager(tk.Tk):
             force=force,
         )
 
-    def _handle_auto_heal(self, tunnel_name: str, ok: bool | None, detail: str):
+    def _handle_auto_heal(self, tunnel_name: str, health):
         """检测到无活跃连接时自动重启 GUI 管理的隧道"""
-        if ok is None:
-            # API/网络异常时不触发自动重启，只记录
-            if detail:
-                self.logger.info(f"跳过自动重连（状态未知）：{detail}")
-            return
-        if not self.auto_heal_var.get():
-            self._health_failures.pop(tunnel_name, None)
-            return
-        if self._supervisor_active and self._supervisor_available:
-            # 由守护进程托管的隧道交由 supervisor 处理
-            self._health_failures.pop(tunnel_name, None)
-            return
-
         proc = self.proc_map.get(tunnel_name)
-        if not (proc and proc.poll() is None):
+        decision = self.coordination_service.plan_auto_heal(
+            tunnel_name,
+            health=health,
+            enabled=bool(self.auto_heal_var.get()),
+            supervisor_managed=self._supervisor_active and self._supervisor_available,
+            process_running=bool(proc and proc.poll() is None),
+            failure_count=self._health_failures.get(tunnel_name, 0),
+            pending=tunnel_name in self._auto_heal_pending,
+        )
+
+        if decision.clear_failure:
             self._health_failures.pop(tunnel_name, None)
+        elif decision.next_failure_count is not None:
+            self._health_failures[tunnel_name] = decision.next_failure_count
+
+        if decision.ui_message:
+            self._append_log(decision.ui_message + "\n", decision.ui_level)
+        if decision.logger_message:
+            self._logger_for_tag(decision.ui_level)(decision.logger_message)
+        if decision.status_message:
+            self.status_var.set(decision.status_message)
+        if not decision.restart:
             return
 
-        if ok is False:
-            # 如果只是测试超时/网络抖动且进程仍在运行，跳过计数
-            reason = (detail or "").lower()
-            if ("超时" in reason or "timeout" in reason) and proc and proc.poll() is None:
-                self._append_log(f"健康检查超时但隧道仍在运行，忽略自动重连。详情：{detail}\n", "warning")
-                self._health_failures.pop(tunnel_name, None)
-                return
-            api_err_keywords = (
-                "rest request failed",
-                "api call",
-                "internal server error",
-                "service unavailable",
-                "status 5",
-                "error parsing tunnel",
-                "隧道信息不完整",
-            )
-            if any(k in reason for k in api_err_keywords):
-                self._append_log(f"健康检查返回 API/5xx 错误，跳过自动重连。详情：{detail}\n", "info")
-                self.logger.info(f"自动重连跳过（API/5xx）：{detail}")
-                self._health_failures.pop(tunnel_name, None)
-                return
+        if decision.mark_pending:
+            self._auto_heal_pending.add(tunnel_name)
 
-            fails = self._health_failures.get(tunnel_name, 0) + 1
-            self._health_failures[tunnel_name] = fails
-            if fails >= 3 and tunnel_name not in self._auto_heal_pending:
-                # 连续多次检测到无连接，执行重启
-                self._health_failures[tunnel_name] = 0
-                self._auto_heal_pending.add(tunnel_name)
-                notice = detail or "无活跃连接"
-                self._append_log(f"检测到隧道 {tunnel_name} 无活跃连接，自动重连中… ({notice})\n", "warning")
-                self.logger.warning(f"自动重连：{tunnel_name} 无活跃连接，准备重启 ({notice})")
-                self.status_var.set(f"自动重连 {tunnel_name}…")
-                persist_flag = bool(self.persist_var.get())
-                path = self.runtime_service.resolve_cloudflared_path(self.cloudflared_path.get().strip())
-                self.after(100, lambda n=tunnel_name, p=persist_flag, c=path: self._restart_gui_tunnel(n, cloudflared_path=c, persist_enabled=p))
-        else:
-            self._health_failures.pop(tunnel_name, None)
+        persist_flag = bool(self.persist_var.get())
+        path = self.runtime_service.resolve_cloudflared_path(self.cloudflared_path.get().strip())
+        self.after(
+            100,
+            lambda n=tunnel_name, p=persist_flag, c=path: self._restart_gui_tunnel(
+                n,
+                cloudflared_path=c,
+                persist_enabled=p,
+            ),
+        )
 
     def _refresh_proc_state(self):
         """检查子进程状态并同步UI（非阻塞版本）"""
@@ -1441,35 +1424,24 @@ class ModernTunnelManager(tk.Tk):
         # 处理健康状态变化的日志和自动修复
         for t in running_tunnels_list:
             tunnel_name = t["name"]
-            ok = t.pop("_health_ok", None)
-            detail = t.get("detail", "")
+            detail = str(t.get("detail", "") or "")
+            health = self.coordination_service.normalize_health_check(
+                t.pop("_health_ok", None),
+                detail,
+            )
+            t["healthy"] = health.ok
 
-            # 如果是 Cloudflare API/5xx 等导致的未知状态，避免触发自动重启
-            if ok is False:
-                lower_detail = (detail or "").lower()
-                api_err_keywords = (
-                    "rest request failed",
-                    "api call",
-                    "internal server error",
-                    "service unavailable",
-                    "status 5",
-                    "error parsing tunnel",
-                    "隧道信息不完整",
-                )
-                if any(k in lower_detail for k in api_err_keywords):
-                    ok = None
-                    self.logger.info(f"隧道 {tunnel_name} 状态未知（API/5xx）：{detail}")
-
-            if ok is False:
+            if health.ok is False:
                 # 仅在状态变化或首次发现时提示
                 prev = self.running_tunnels.get(tunnel_name, {})
                 if prev.get("healthy") is not False:
                     self._append_log(f"隧道 {tunnel_name} 无活跃连接：{detail}\n", "warning")
                     self.logger.warning(f"隧道 {tunnel_name} 无活跃连接：{detail}")
-            elif ok is None and detail:
+            elif health.ok is None and detail:
                 # 明确标记“未知”状态，方便排查 API/网络问题
-                self.logger.info(f"隧道 {tunnel_name} 状态未知（跳过自动重启）：{detail}")
-            self._handle_auto_heal(tunnel_name, ok, detail)
+                reason = "API/5xx" if health.reason == "api_error" else "跳过自动重启"
+                self.logger.info(f"隧道 {tunnel_name} 状态未知（{reason}）：{detail}")
+            self._handle_auto_heal(tunnel_name, health)
 
         old_running = set(self.running_tunnels.keys())
         new_running = {t["name"] for t in running_tunnels_list}
@@ -2092,31 +2064,19 @@ class ModernTunnelManager(tk.Tk):
 
     def _check_supervisor_lock(self, log_message: bool = True) -> bool:
         """检测是否存在激活的隧道守护进程"""
-        self._supervisor_available = self.supervisor_client.is_available()
-        info = self.supervisor_lock.info()
-        previous = self._supervisor_active
-        self._supervisor_active = bool(info and info.get("alive"))
+        result = self.coordination_service.sync_supervisor_state(
+            self._supervisor_active,
+            log_message=log_message,
+        )
+        self._supervisor_available = result.available
+        self._supervisor_active = result.active
 
-        if self._supervisor_active and log_message and not previous:
-            owner = info.get("owner", "tunnel-supervisor")
-            pid = info.get("pid", "?")
-            if self._supervisor_available:
-                self._append_log(
-                    f"检测到守护进程 (PID: {pid}, owner: {owner}) 正在运行，GUI 将通过守护进程执行操作。\n",
-                    "info"
-                )
-                self.logger.info("GUI 将把启动/停止请求转发给守护进程")
-            else:
-                self._append_log(
-                    f"检测到守护进程正在管理隧道 (PID: {pid})，GUI 无法直接控制。\n",
-                    "warning"
-                )
-                self.logger.warning("守护进程运行中但缺少客户端支持")
-        elif not self._supervisor_active and previous:
-            self._append_log("守护进程已离线，GUI 恢复直接管理。\n", "info")
-            self.logger.info("守护进程离线，GUI 恢复控制权")
+        if result.ui_message:
+            self._append_log(result.ui_message + "\n", result.ui_level)
+        if result.logger_message:
+            self._logger_for_tag(result.ui_level)(result.logger_message)
 
-        return self._supervisor_active
+        return result.active
 
     def _format_supervisor_status_payload(self, payload: dict) -> str:
         entries = payload.get("entries")
@@ -2264,52 +2224,49 @@ class ModernTunnelManager(tk.Tk):
 
     def _auto_start_if_enabled(self, force: bool = False):
         """必要时自动启动隧道"""
-        if self._auto_start_done and not force:
-            return
-
-        enabled = self.settings.get("tunnel.auto_start_enabled", False)
-        if not enabled:
-            self._auto_start_done = True
-            return
-
         target = self.settings.get("tunnel.autostart_tunnel") or self.settings.get("tunnel.last_selected")
-        if not target:
-            self._append_log("自动启动已启用，但未找到可用的隧道记录。\n", "warning")
-            self.logger.warning("自动启动缺少目标")
+        plan = self.coordination_service.plan_autostart(
+            already_done=self._auto_start_done,
+            force=force,
+            enabled=bool(self.settings.get("tunnel.auto_start_enabled", False)),
+            target=target,
+            supervisor_active=self._supervisor_active,
+            supervisor_available=self._supervisor_available,
+            is_running=self._is_tunnel_running(target) if target else False,
+        )
+
+        if plan.ui_message:
+            self._append_log(plan.ui_message + "\n", plan.ui_level)
+        if plan.logger_message:
+            self._logger_for_tag(plan.ui_level)(plan.logger_message)
+
+        if plan.action == "noop":
             self._auto_start_done = True
             return
 
-        if self._supervisor_active and self._supervisor_available:
-            ok, msg = self.supervisor_client.start_tunnel(target)
+        if plan.action == "supervisor" and plan.target:
+            ok, msg = self.supervisor_client.start_tunnel(plan.target)
             if ok:
-                self.logger.info(f"自动启动指令已发送给守护进程: {target}")
+                self.logger.info(f"自动启动指令已发送给守护进程: {plan.target}")
             else:
-                self.logger.error(f"守护进程自动启动 {target} 失败: {msg}")
-            self._auto_start_done = True
-            return
-        elif self._supervisor_active:
-            self.logger.warning("检测到守护进程运行中，但 GUI 无法通信，自动启动跳过")
+                self.logger.error(f"守护进程自动启动 {plan.target} 失败: {msg}")
             self._auto_start_done = True
             return
 
-        if self._is_tunnel_running(target):
-            self._append_log(f"自动启动: 隧道 {target} 已在运行。\n", "info")
-            self.logger.info(f"自动启动跳过，{target} 已运行")
+        if plan.action != "direct" or not plan.target:
             self._auto_start_done = True
             return
 
         if hasattr(self, "tunnel_list"):
-            if not self.tunnel_list.select_by_name(target):
-                self._append_log(f"自动启动失败：未找到隧道 {target}\n", "error")
-                self.logger.error(f"自动启动失败，未找到 {target}")
+            if not self.tunnel_list.select_by_name(plan.target):
+                self._append_log(f"自动启动失败：未找到隧道 {plan.target}\n", "error")
+                self.logger.error(f"自动启动失败，未找到 {plan.target}")
                 self._auto_start_done = True
                 return
         else:
             self._auto_start_done = True
             return
 
-        self._append_log(f"开机自动激活隧道: {target}\n", "info")
-        self.logger.info(f"开始自动激活隧道: {target}")
         self._start_selected()
         self._auto_start_done = True
 

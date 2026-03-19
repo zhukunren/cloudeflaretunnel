@@ -11,20 +11,34 @@ from .dns_service import DnsRouteService
 from .tunnel_catalog_service import TunnelCatalogLoadResult, TunnelCatalogMutationResult, TunnelCatalogService
 from .tunnel_diagnostics_service import DiagnosticLine, TunnelDiagnosticsService
 from .tunnel_lifecycle_service import TunnelLifecycleService
+from .tunnel_coordination_service import (
+    AutoHealDecision,
+    AutoStartPlan,
+    AutoStartToggleResult,
+    HealthCheckResult,
+    SupervisorSyncResult,
+    TunnelCoordinationService,
+)
 from .tunnel_runtime_service import TunnelRuntimeService
 
 __all__ = [
+    "AutoHealDecision",
+    "AutoStartPlan",
+    "AutoStartToggleResult",
     "AuthService",
     "CloudflaredBinaryService",
     "CloudflaredDownloadResult",
     "CloudflaredVersionInfo",
     "DiagnosticLine",
     "DnsRouteService",
+    "HealthCheckResult",
     "OriginCertStatus",
+    "SupervisorSyncResult",
     "TunnelConfigService",
     "TunnelCatalogLoadResult",
     "TunnelCatalogMutationResult",
     "TunnelCatalogService",
+    "TunnelCoordinationService",
     "TunnelDiagnosticsService",
     "TunnelLifecycleService",
     "TunnelRuntimeService",
