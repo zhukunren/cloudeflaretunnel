@@ -1491,15 +1491,19 @@ class ModernTunnelManager(tk.Tk):
             self._update_status_display()
             self._update_toggle_button_state()
 
+    def _build_launch_output_options(self, tunnel_name: str, persist_enabled: bool) -> tuple[bool, Path | None]:
+        """根据持久化开关生成启动输出选项。"""
+        if not persist_enabled:
+            return True, None
+
+        log_dir = get_persistent_logs_dir()
+        log_dir.mkdir(parents=True, exist_ok=True)
+        return False, log_dir / f"{tunnel_name}.log"
+
     def _auto_heal_worker(self, tunnel_name: str, cloudflared_path: str, persist_enabled: bool):
         """后台执行自动重连，避免阻塞UI线程"""
         cfg = self._config_path_for(tunnel_name)
-        capture_output = not persist_enabled
-        log_file = None
-        if persist_enabled:
-            log_dir = get_persistent_logs_dir()
-            log_dir.mkdir(parents=True, exist_ok=True)
-            log_file = log_dir / f"{tunnel_name}.log"
+        capture_output, log_file = self._build_launch_output_options(tunnel_name, persist_enabled)
 
         self.after(0, lambda: self._append_log(f"自动重连：准备重启隧道 {tunnel_name} …\n", "info"))
 
@@ -2738,12 +2742,7 @@ class ModernTunnelManager(tk.Tk):
             return
 
         persist_enabled = bool(self.persist_var.get())
-        capture_output = not persist_enabled
-        log_file = None
-        if persist_enabled:
-            log_dir = get_persistent_logs_dir()
-            log_dir.mkdir(parents=True, exist_ok=True)
-            log_file = log_dir / f"{name}.log"
+        capture_output, log_file = self._build_launch_output_options(name, persist_enabled)
 
         cfg = self._config_path_for(name)
 
