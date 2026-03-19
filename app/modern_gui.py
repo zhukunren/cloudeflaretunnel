@@ -1364,34 +1364,30 @@ class ModernTunnelManager(tk.Tk):
             ),
         )
 
-    def _refresh_proc_state(self):
-        """检查子进程状态并同步UI（非阻塞版本）"""
-        # 先在主线程快速检查本地进程状态（不阻塞）
-        self.proc_tracker.cleanup_dead()
-        self._check_supervisor_lock(log_message=False)
+    def _cleanup_exited_gui_processes(self) -> bool:
+        """清理已经退出的 GUI 托管进程，并同步相关运行态缓存。"""
         cleaned = False
-        # 先检查所有GUI启动的进程是否仍在运行
         for name, proc in list(self.proc_map.items()):
-            if proc and proc.poll() is not None:
-                self._append_log(f"隧道 {name} 进程已退出\n", "warning")
-                self.logger.warning(f"隧道 {name} 进程已退出")
-                if proc is self.proc:
-                    self.proc = None
-                    self.proc_thread = None
-                self.proc_tracker.unregister(name, expected_pid=proc.pid)
-                del self.proc_map[name]
-                cleaned = True
-                self._health_failures.pop(name, None)
-                self._auto_heal_pending.discard(name)
+            if not proc or proc.poll() is None:
+                continue
 
-        if cleaned and not self._manual_operation:
-            self.status_var.set("隧道已停止")
+            self._append_log(f"隧道 {name} 进程已退出\n", "warning")
+            self.logger.warning(f"隧道 {name} 进程已退出")
+            if proc is self.proc:
+                self.proc = None
+                self.proc_thread = None
+            self.proc_tracker.unregister(name, expected_pid=proc.pid)
+            del self.proc_map[name]
+            self._health_failures.pop(name, None)
+            self._auto_heal_pending.discard(name)
+            cleaned = True
+        return cleaned
 
-        # 如果后台刷新正在运行，跳过本次
+    def _start_background_status_refresh(self):
+        """启动后台状态刷新线程；若已有刷新任务则直接跳过。"""
         if self._status_refresh_running:
             return
 
-        # 启动后台线程执行耗时操作
         self._status_refresh_running = True
         cloudflared_path = self.runtime_service.resolve_cloudflared_path(self.cloudflared_path.get().strip())
         threading.Thread(
@@ -1399,6 +1395,66 @@ class ModernTunnelManager(tk.Tk):
             args=(cloudflared_path,),
             daemon=True,
         ).start()
+
+    def _apply_running_tunnel_health(self, tunnel: dict):
+        """标准化单个运行中隧道的健康状态，并触发必要日志与自动修复。"""
+        tunnel_name = tunnel["name"]
+        detail = str(tunnel.get("detail", "") or "")
+        health = self.coordination_service.normalize_health_check(
+            tunnel.pop("_health_ok", None),
+            detail,
+        )
+        tunnel["healthy"] = health.ok
+
+        if health.ok is False:
+            prev = self.running_tunnels.get(tunnel_name, {})
+            if prev.get("healthy") is not False:
+                self._append_log(f"隧道 {tunnel_name} 无活跃连接：{detail}\n", "warning")
+                self.logger.warning(f"隧道 {tunnel_name} 无活跃连接：{detail}")
+        elif health.ok is None and detail:
+            reason = "API/5xx" if health.reason == "api_error" else "跳过自动重启"
+            self.logger.info(f"隧道 {tunnel_name} 状态未知（{reason}）：{detail}")
+
+        self._handle_auto_heal(tunnel_name, health)
+
+    def _merge_gui_running_tunnels(self) -> bool:
+        """补齐由 GUI 启动但尚未出现在系统探测结果中的隧道。"""
+        added = False
+        for name, proc in self.proc_map.items():
+            if proc and proc.poll() is None and name not in self.running_tunnels:
+                self.running_tunnels[name] = {
+                    "name": name,
+                    "pid": proc.pid,
+                    "healthy": None,
+                }
+                added = True
+        return added
+
+    def _sync_running_tunnel_snapshot(self, running_tunnels_list: list) -> bool:
+        """更新运行态快照，并返回是否需要刷新左侧列表状态。"""
+        old_running = set(self.running_tunnels.keys())
+        old_health = {name: info.get("healthy") for name, info in self.running_tunnels.items()}
+
+        self.running_tunnels = {t["name"]: t for t in running_tunnels_list}
+        new_running = {t["name"] for t in running_tunnels_list}
+        new_health = {t["name"]: t.get("healthy") for t in running_tunnels_list}
+        list_changed = old_running != new_running or old_health != new_health
+
+        if self._merge_gui_running_tunnels():
+            list_changed = True
+        return list_changed
+
+    def _refresh_proc_state(self):
+        """检查子进程状态并同步UI（非阻塞版本）"""
+        # 先在主线程快速检查本地进程状态（不阻塞）
+        self.proc_tracker.cleanup_dead()
+        self._check_supervisor_lock(log_message=False)
+        cleaned = self._cleanup_exited_gui_processes()
+
+        if cleaned and not self._manual_operation:
+            self.status_var.set("隧道已停止")
+
+        self._start_background_status_refresh()
 
     def _background_status_check(self, cloudflared_path: str | None):
         """后台线程：执行耗时的状态检查操作"""
@@ -1421,56 +1477,10 @@ class ModernTunnelManager(tk.Tk):
 
     def _apply_status_update(self, running_tunnels_list: list):
         """主线程：应用后台线程获取的状态更新"""
-        # 处理健康状态变化的日志和自动修复
-        for t in running_tunnels_list:
-            tunnel_name = t["name"]
-            detail = str(t.get("detail", "") or "")
-            health = self.coordination_service.normalize_health_check(
-                t.pop("_health_ok", None),
-                detail,
-            )
-            t["healthy"] = health.ok
+        for tunnel in running_tunnels_list:
+            self._apply_running_tunnel_health(tunnel)
 
-            if health.ok is False:
-                # 仅在状态变化或首次发现时提示
-                prev = self.running_tunnels.get(tunnel_name, {})
-                if prev.get("healthy") is not False:
-                    self._append_log(f"隧道 {tunnel_name} 无活跃连接：{detail}\n", "warning")
-                    self.logger.warning(f"隧道 {tunnel_name} 无活跃连接：{detail}")
-            elif health.ok is None and detail:
-                # 明确标记“未知”状态，方便排查 API/网络问题
-                reason = "API/5xx" if health.reason == "api_error" else "跳过自动重启"
-                self.logger.info(f"隧道 {tunnel_name} 状态未知（{reason}）：{detail}")
-            self._handle_auto_heal(tunnel_name, health)
-
-        old_running = set(self.running_tunnels.keys())
-        new_running = {t["name"] for t in running_tunnels_list}
-
-        # 检查健康状态是否有变化
-        old_health = {name: info.get("healthy") for name, info in self.running_tunnels.items()}
-        new_health = {t["name"]: t.get("healthy") for t in running_tunnels_list}
-        health_changed = old_health != new_health
-
-        # 更新 running_tunnels 字典
-        self.running_tunnels = {t["name"]: t for t in running_tunnels_list}
-
-        # 如果运行状态或健康状态有变化，刷新列表状态
-        if old_running != new_running or health_changed:
-            if hasattr(self, "tunnel_list"):
-                self.tunnel_list.refresh_all_status()
-
-        # 确保GUI启动的隧道在running_tunnels中（防止ps延迟）
-        added = False
-        for name, proc in self.proc_map.items():
-            if proc and proc.poll() is None and name not in self.running_tunnels:
-                self.running_tunnels[name] = {
-                    "name": name,
-                    "pid": proc.pid,
-                    "healthy": None,
-                }
-                added = True
-
-        if added and hasattr(self, "tunnel_list"):
+        if self._sync_running_tunnel_snapshot(running_tunnels_list) and hasattr(self, "tunnel_list"):
             self.tunnel_list.refresh_all_status()
 
         # 只在非手动操作时更新UI（避免闪烁）
