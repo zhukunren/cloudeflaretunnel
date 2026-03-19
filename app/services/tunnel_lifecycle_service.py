@@ -7,10 +7,12 @@ from pathlib import Path
 try:
     from .. import cloudflared_cli as cf
     from .dns_service import DnsRouteService
+    from .tunnel_operation_service import TunnelOperationService
     from .tunnel_config_service import TunnelConfigService
 except (ImportError, ValueError):
     import cloudflared_cli as cf  # type: ignore
     from services.dns_service import DnsRouteService  # type: ignore
+    from services.tunnel_operation_service import TunnelOperationService  # type: ignore
     from services.tunnel_config_service import TunnelConfigService  # type: ignore
 
 
@@ -21,9 +23,11 @@ class TunnelLifecycleService:
         self,
         dns_service: DnsRouteService | None = None,
         config_service: TunnelConfigService | None = None,
+        operation_service: TunnelOperationService | None = None,
     ):
         self.dns_service = dns_service or DnsRouteService()
         self.config_service = config_service or TunnelConfigService()
+        self.operation_service = operation_service or TunnelOperationService()
 
     def cleanup_residual_tunnel(self, tunnel_name: str) -> tuple[bool, str | None, str | None]:
         try:
@@ -40,6 +44,82 @@ class TunnelLifecycleService:
 
     def ensure_dns_routes(self, cloudflared_path: str, tunnel_name: str, hostnames: list[str]) -> dict:
         return self.dns_service.ensure_routes(cloudflared_path, tunnel_name, hostnames)
+
+    def start_direct_tunnel(
+        self,
+        cloudflared_path: str,
+        tunnel_name: str,
+        tunnel_id: str,
+        config_path: Path,
+        capture_output: bool,
+        log_file: Path | None,
+    ) -> dict:
+        payload = self.operation_service.new_start_result(tunnel_name, "gui")
+
+        cleaned, msg, error = self.cleanup_residual_tunnel(tunnel_name)
+        if cleaned and msg:
+            payload["messages"].append(f"启动前清理残留隧道: {msg}")
+        if error:
+            payload["warnings"].append(f"清理残留隧道异常: {error}")
+
+        config_result = self.prepare_start_config(tunnel_name, tunnel_id, config_path)
+        payload["messages"].extend(config_result.get("messages", []))
+        payload["warnings"].extend(config_result.get("warnings", []))
+        if not config_result.get("ok"):
+            message = str(config_result.get("error") or "配置处理失败").strip()
+            payload.update(
+                {
+                    "ok": False,
+                    "stage": "config",
+                    "message": message,
+                    "summary": message,
+                    "error": message,
+                }
+            )
+            return payload
+
+        validate_result = self.normalize_and_validate_config(config_path)
+        payload["warnings"].extend(validate_result.get("warnings", []))
+        hostnames = list(validate_result.get("hostnames", []) or [])
+        payload["hostnames"] = hostnames
+        if not validate_result.get("ok"):
+            message = str(validate_result.get("error") or "配置校验失败").strip()
+            payload.update(
+                {
+                    "ok": False,
+                    "stage": "config",
+                    "message": message,
+                    "summary": message,
+                    "error": message,
+                }
+            )
+            return payload
+
+        dns_result = self.ensure_dns_routes(cloudflared_path, tunnel_name, hostnames)
+        payload["messages"].extend(dns_result.get("messages", []))
+        payload["warnings"].extend(dns_result.get("warnings", []))
+        if not dns_result.get("ok"):
+            message = str(dns_result.get("error") or "DNS 路由失败").strip()
+            payload.update(
+                {
+                    "ok": False,
+                    "stage": "dns",
+                    "hostname": dns_result.get("hostname"),
+                    "message": message,
+                    "summary": message,
+                    "error": message,
+                }
+            )
+            return payload
+
+        launch = self.launch_tunnel(
+            cloudflared_path,
+            tunnel_name,
+            config_path,
+            capture_output,
+            log_file,
+        )
+        return self.operation_service.build_direct_start_result(tunnel_name, launch, payload)
 
     def launch_tunnel(
         self,

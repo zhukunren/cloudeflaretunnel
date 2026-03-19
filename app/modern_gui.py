@@ -505,7 +505,7 @@ class ModernTunnelManager(tk.Tk):
         self.catalog_service = TunnelCatalogService(self._project_root, self.config_service)
         self.dns_service = DnsRouteService()
         self.diagnostics_service = TunnelDiagnosticsService()
-        self.lifecycle_service = TunnelLifecycleService(self.dns_service, self.config_service)
+        self.lifecycle_service = TunnelLifecycleService(self.dns_service, self.config_service, self.operation_service)
         self.proc = None
         self.proc_thread = None
         self.proc_queue = queue.Queue()
@@ -2681,58 +2681,6 @@ class ModernTunnelManager(tk.Tk):
         payload = self.supervisor_client.start_tunnel_payload(tunnel_name)
         return self.operation_service.build_supervisor_start_result(tunnel_name, payload)
 
-    def _cleanup_start_residual_tunnel(self, tunnel_name: str, payload: dict):
-        """直接启动前尽力清理残留进程，避免旧状态干扰。"""
-        cleaned, msg, error = self.lifecycle_service.cleanup_residual_tunnel(tunnel_name)
-        if cleaned:
-            try:
-                self.proc_tracker.unregister(tunnel_name)
-            except Exception:
-                pass
-            if msg:
-                payload["messages"].append(f"启动前清理残留隧道: {msg}")
-            return
-        if error:
-            payload["warnings"].append(f"清理残留隧道异常: {error}")
-
-    def _prepare_start_config(
-        self,
-        tunnel_name: str,
-        tunnel_id: str,
-        cfg: Path,
-        payload: dict,
-    ) -> tuple[bool, str | None]:
-        """确保配置文件存在，并且 tunnel id 与当前选择一致。"""
-        result = self.lifecycle_service.prepare_start_config(tunnel_name, tunnel_id, cfg)
-        payload["messages"].extend(result.get("messages", []))
-        payload["warnings"].extend(result.get("warnings", []))
-        return bool(result.get("ok")), result.get("error")
-
-    def _normalize_and_validate_start_config(
-        self,
-        cfg: Path,
-        payload: dict,
-    ) -> tuple[bool, list[str] | None, str | None]:
-        """执行安全修正、验证配置，并收集 hostname 列表。"""
-        result = self.lifecycle_service.normalize_and_validate_config(cfg)
-        payload["warnings"].extend(result.get("warnings", []))
-        hostnames = result.get("hostnames", [])
-        payload["hostnames"] = hostnames
-        return bool(result.get("ok")), hostnames, result.get("error")
-
-    def _ensure_start_dns_routes(
-        self,
-        cloudflared_path: str,
-        tunnel_name: str,
-        hostnames: list[str],
-        payload: dict,
-    ) -> tuple[bool, str | None, str | None]:
-        """在启动前确保配置中的 hostname 已完成 DNS 路由。"""
-        result = self.lifecycle_service.ensure_dns_routes(cloudflared_path, tunnel_name, hostnames)
-        payload["messages"].extend(result.get("messages", []))
-        payload["warnings"].extend(result.get("warnings", []))
-        return bool(result.get("ok")), result.get("hostname"), result.get("error")
-
     def _edit_selected_config(self):
         """编辑配置（使用内置编辑器）"""
         item = self._require_selected_tunnel()
@@ -2810,56 +2758,14 @@ class ModernTunnelManager(tk.Tk):
             supervisor_result = self._start_via_supervisor_if_available(name)
             if supervisor_result is not None:
                 return supervisor_result
-
-            payload = self.operation_service.new_start_result(name, "gui")
-
-            self._cleanup_start_residual_tunnel(name, payload)
-
-            ok, error = self._prepare_start_config(name, tid, cfg, payload)
-            if not ok:
-                message = str(error or "配置处理失败").strip()
-                payload.update(
-                    {
-                        "ok": False,
-                        "stage": "config",
-                        "message": message,
-                        "summary": message,
-                        "error": message,
-                    }
-                )
-                return payload
-
-            ok, hostnames, error = self._normalize_and_validate_start_config(cfg, payload)
-            if not ok:
-                message = str(error or "配置校验失败").strip()
-                payload.update(
-                    {
-                        "ok": False,
-                        "stage": "config",
-                        "message": message,
-                        "summary": message,
-                        "error": message,
-                    }
-                )
-                return payload
-
-            ok, hostname, error = self._ensure_start_dns_routes(path, name, hostnames or [], payload)
-            if not ok:
-                message = str(error or "DNS 路由失败").strip()
-                payload.update(
-                    {
-                        "ok": False,
-                        "stage": "dns",
-                        "hostname": hostname,
-                        "message": message,
-                        "summary": message,
-                        "error": message,
-                    }
-                )
-                return payload
-
-            launch = self._launch_tunnel_worker(path, name, cfg, capture_output, log_file)
-            return self.operation_service.build_direct_start_result(name, launch, payload)
+            return self.lifecycle_service.start_direct_tunnel(
+                path,
+                name,
+                tid,
+                cfg,
+                capture_output,
+                log_file,
+            )
 
         self._run_async_tunnel_operation(
             _worker,
