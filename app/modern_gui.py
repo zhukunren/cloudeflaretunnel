@@ -2280,6 +2280,46 @@ class ModernTunnelManager(tk.Tk):
         self._start_selected()
         self._auto_start_done = True
 
+    def _begin_tunnel_operation(
+        self,
+        *,
+        button_text: str,
+        status_text: str,
+        log_message: str,
+        log_tag: str,
+    ):
+        """统一锁定隧道操作按钮，并同步操作中的 UI 文案。"""
+        self._tunnel_operation_in_progress = True
+        self._manual_operation = True
+        if self.toggle_button:
+            try:
+                self.toggle_button.configure(state=tk.DISABLED)
+            except Exception:
+                pass
+        self.toggle_button_var.set(button_text)
+        self.status_var.set(status_text)
+        self._append_log(log_message + "\n", log_tag)
+        self._logger_for_tag(log_tag)(log_message)
+
+    def _run_async_tunnel_operation(
+        self,
+        worker: Callable[[], dict],
+        on_complete: Callable[[dict], None],
+        on_exception: Callable[[Exception], dict],
+    ):
+        """在线程中执行隧道操作，并把结果安全地回送到主线程。"""
+        def _thread_entry():
+            try:
+                result = worker()
+            except Exception as exc:
+                result = on_exception(exc)
+            try:
+                self.after(0, lambda r=result: on_complete(r))
+            except Exception:
+                pass
+
+        threading.Thread(target=_thread_entry, daemon=True).start()
+
     def _schedule_status_refresh(self):
         """定期刷新隧道状态（每5秒）"""
         # 只有在没有进行其他操作时才自动刷新
@@ -2887,17 +2927,12 @@ class ModernTunnelManager(tk.Tk):
 
         cfg = self._config_path_for(name)
 
-        self._tunnel_operation_in_progress = True
-        self._manual_operation = True
-        if self.toggle_button:
-            try:
-                self.toggle_button.configure(state=tk.DISABLED)
-            except Exception:
-                pass
-        self.toggle_button_var.set("⏳ 启动中…")
-        self.status_var.set(f"启动中：{name}")
-        self._append_log(f"正在启动隧道: {name}...\n", "info")
-        self.logger.info(f"开始启动隧道: {name}")
+        self._begin_tunnel_operation(
+            button_text="⏳ 启动中…",
+            status_text=f"启动中：{name}",
+            log_message=f"正在启动隧道: {name}...",
+            log_tag="info",
+        )
 
         def _worker() -> dict:
             supervisor_result = self._start_via_supervisor_if_available(name)
@@ -2954,27 +2989,19 @@ class ModernTunnelManager(tk.Tk):
             launch = self._launch_tunnel_worker(path, name, cfg, capture_output, log_file)
             return self._build_direct_start_result(name, launch, payload)
 
-        def _thread_entry():
-            try:
-                result = _worker()
-            except Exception as exc:
-                error = str(exc).strip()
-                result = self._new_start_result(
-                    name,
-                    "gui",
-                    ok=False,
-                    stage="exception",
-                    message=error,
-                    summary=error,
-                    error=error,
-                )
-            try:
-                self.after(0, lambda r=result: self._finish_start_selected(name, r))
-            except Exception:
-                # 视为窗口已关闭
-                pass
-
-        threading.Thread(target=_thread_entry, daemon=True).start()
+        self._run_async_tunnel_operation(
+            _worker,
+            lambda result: self._finish_start_selected(name, result),
+            lambda exc: self._new_start_result(
+                name,
+                "gui",
+                ok=False,
+                stage="exception",
+                message=str(exc).strip(),
+                summary=str(exc).strip(),
+                error=str(exc).strip(),
+            ),
+        )
 
     def _stop_via_supervisor_if_available(self, tunnel_name: str) -> dict | None:
         """如果当前由 supervisor 托管，则转交给 supervisor 停止。"""
@@ -3061,41 +3088,29 @@ class ModernTunnelManager(tk.Tk):
             self._notify_tunnel_not_running(tunnel_name)
             return
 
-        self._tunnel_operation_in_progress = True
-        self._manual_operation = True
-        if self.toggle_button:
-            try:
-                self.toggle_button.configure(state=tk.DISABLED)
-            except Exception:
-                pass
-        self.toggle_button_var.set("⏳ 停止中…")
-        self.status_var.set(f"停止中：{tunnel_name}")
-        self._append_log(f"正在停止隧道 {tunnel_name}...\n", "warning")
-        self.logger.warning(f"正在停止隧道 {tunnel_name}")
+        self._begin_tunnel_operation(
+            button_text="⏳ 停止中…",
+            status_text=f"停止中：{tunnel_name}",
+            log_message=f"正在停止隧道 {tunnel_name}...",
+            log_tag="warning",
+        )
 
         proc = self.proc_map.get(tunnel_name)
 
-        def _thread_entry():
-            try:
-                result = self._stop_tunnel_worker(tunnel_name, proc)
-            except Exception as exc:
-                error = str(exc).strip()
-                result = self._new_stop_result(
-                    tunnel_name,
-                    "gui",
-                    ok=False,
-                    stage="exception",
-                    message=error,
-                    summary=error,
-                    error=error,
-                    method="exception",
-                )
-            try:
-                self.after(0, lambda r=result: self._finish_stop_running(tunnel_name, r))
-            except Exception:
-                pass
-
-        threading.Thread(target=_thread_entry, daemon=True).start()
+        self._run_async_tunnel_operation(
+            lambda: self._stop_tunnel_worker(tunnel_name, proc),
+            lambda result: self._finish_stop_running(tunnel_name, result),
+            lambda exc: self._new_stop_result(
+                tunnel_name,
+                "gui",
+                ok=False,
+                stage="exception",
+                message=str(exc).strip(),
+                summary=str(exc).strip(),
+                error=str(exc).strip(),
+                method="exception",
+            ),
+        )
 
     def _run_tunnel_diagnostics(
         self,
