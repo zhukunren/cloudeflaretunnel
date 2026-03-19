@@ -20,6 +20,7 @@ from .tunnel_coordination_service import (
     TunnelCoordinationService,
 )
 from .tunnel_runtime_service import TunnelRuntimeService
+from .tunnel_operation_service import TunnelOperationService
 
 __all__ = [
     "AutoHealDecision",
@@ -41,5 +42,6 @@ __all__ = [
     "TunnelCoordinationService",
     "TunnelDiagnosticsService",
     "TunnelLifecycleService",
+    "TunnelOperationService",
     "TunnelRuntimeService",
 ]

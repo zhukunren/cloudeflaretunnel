@@ -31,6 +31,7 @@ try:
         TunnelConfigService,
         TunnelDiagnosticsService,
         TunnelLifecycleService,
+        TunnelOperationService,
         TunnelRuntimeService,
     )
     from .utils.theme import Theme
@@ -54,6 +55,7 @@ except (ImportError, ValueError):
         TunnelConfigService,
         TunnelDiagnosticsService,
         TunnelLifecycleService,
+        TunnelOperationService,
         TunnelRuntimeService,
     )
     from utils.theme import Theme
@@ -497,6 +499,7 @@ class ModernTunnelManager(tk.Tk):
         self.supervisor_client = SupervisorClient(self._project_root)
         self._supervisor_available = self.supervisor_client.is_available()
         self.coordination_service = TunnelCoordinationService(self.supervisor_lock, self.supervisor_client)
+        self.operation_service = TunnelOperationService()
         self.auth_service = AuthService()
         self.config_service = TunnelConfigService()
         self.catalog_service = TunnelCatalogService(self._project_root, self.config_service)
@@ -1688,134 +1691,6 @@ class ModernTunnelManager(tk.Tk):
         self._record_feedback_lines(result.get("messages", []), "info")
         self._record_feedback_lines(result.get("warnings", []), "warning")
 
-    def _new_start_result(self, tunnel_name: str, managed_by: str, **overrides) -> dict:
-        """创建统一的启动结果对象，避免 direct/supervisor 各自返回不同结构。"""
-        result = {
-            "ok": False,
-            "stage": "prepare",
-            "tunnel_name": tunnel_name,
-            "managed_by": managed_by,
-            "message": "",
-            "summary": "",
-            "detail": "",
-            "messages": [],
-            "warnings": [],
-            "logs": [],
-            "proc": None,
-            "protocol": None,
-            "capture_output": None,
-            "log_file": None,
-            "error": None,
-            "hostname": None,
-        }
-        result.update(overrides)
-        return result
-
-    def _build_direct_start_result(self, tunnel_name: str, launch: dict, context: dict) -> dict:
-        """将 direct 启动结果收敛成统一结果对象。"""
-        ok = bool(launch.get("ok"))
-        detail = str(launch.get("detail") or "").strip()
-        error = str(launch.get("error") or "").strip()
-        message = detail or error or (f"隧道 {tunnel_name} 已启动" if ok else f"隧道 {tunnel_name} 启动失败")
-
-        result = self._new_start_result(
-            tunnel_name,
-            "gui",
-            ok=ok,
-            stage="running" if ok else "launch",
-            message=message,
-            summary=detail or error,
-            detail=detail,
-            messages=list(context.get("messages", []) or []),
-            warnings=list(context.get("warnings", []) or []),
-            proc=launch.get("proc"),
-            protocol=launch.get("protocol"),
-            capture_output=launch.get("capture_output", True),
-            log_file=launch.get("log_file"),
-        )
-        if error:
-            result["error"] = error
-        return result
-
-    def _build_supervisor_start_result(self, tunnel_name: str, payload: dict) -> dict:
-        """将 supervisor CLI 返回值映射为统一启动结果对象。"""
-        ok = bool(payload.get("ok"))
-        default = f"隧道 {tunnel_name} {'已由守护进程启动' if ok else '启动失败'}"
-        message = self._supervisor_payload_message(payload, default)
-        logs = payload.get("logs")
-        result = self._new_start_result(
-            tunnel_name,
-            "supervisor",
-            ok=ok,
-            stage="accepted" if ok else "launch",
-            message=message,
-            summary=message,
-            detail=str(payload.get("detail") or payload.get("stderr") or "").strip(),
-            logs=list(logs) if isinstance(logs, list) else [],
-        )
-        if not ok:
-            result["error"] = str(payload.get("stderr") or message).strip()
-        return result
-
-    def _new_stop_result(self, tunnel_name: str, managed_by: str, **overrides) -> dict:
-        """创建统一的停止结果对象，供 direct/supervisor 共用。"""
-        result = {
-            "ok": False,
-            "stage": "stop",
-            "tunnel_name": tunnel_name,
-            "managed_by": managed_by,
-            "message": "",
-            "summary": "",
-            "detail": "",
-            "logs": [],
-            "pid": None,
-            "method": None,
-            "error": None,
-        }
-        result.update(overrides)
-        return result
-
-    def _build_direct_stop_result(self, tunnel_name: str, payload: dict) -> dict:
-        """将 lifecycle service 的停止结果映射为 GUI 统一结构。"""
-        ok = bool(payload.get("ok"))
-        message = str(payload.get("message") or "").strip()
-        error = str(payload.get("error") or "").strip()
-        summary = message or error or (f"隧道 {tunnel_name} 已停止" if ok else f"隧道 {tunnel_name} 停止失败")
-        result = self._new_stop_result(
-            tunnel_name,
-            "gui",
-            ok=ok,
-            stage="stopped" if ok else "stop",
-            message=summary,
-            summary=summary,
-            detail=message,
-            pid=payload.get("pid"),
-            method=payload.get("method"),
-        )
-        if error:
-            result["error"] = error
-        return result
-
-    def _build_supervisor_stop_result(self, tunnel_name: str, payload: dict) -> dict:
-        """将 supervisor CLI 的停止结果映射为 GUI 统一结构。"""
-        ok = bool(payload.get("ok"))
-        default = f"隧道 {tunnel_name} {'已由守护进程停止' if ok else '停止失败'}"
-        message = self._supervisor_payload_message(payload, default)
-        logs = payload.get("logs")
-        result = self._new_stop_result(
-            tunnel_name,
-            "supervisor",
-            ok=ok,
-            stage="accepted" if ok else "stop",
-            message=message,
-            summary=message,
-            detail=str(payload.get("detail") or payload.get("stderr") or "").strip(),
-            logs=list(logs) if isinstance(logs, list) else [],
-        )
-        if not ok:
-            result["error"] = str(payload.get("stderr") or message).strip()
-        return result
-
     def _adopt_running_tunnel(
         self,
         tunnel_name: str,
@@ -1906,7 +1781,7 @@ class ModernTunnelManager(tk.Tk):
             return True
 
         if result.get("managed_by") == "supervisor":
-            msg = self._supervisor_payload_message(result, "启动指令已发送")
+            msg = self.operation_service.payload_message(result, "启动指令已发送")
             self._record_feedback(f"守护进程应答: {msg or '启动指令已发送'}", "success")
             self.logger.info(f"守护进程启动 {tunnel_name}: {msg}")
             self.status_var.set("启动指令已发送")
@@ -2130,9 +2005,6 @@ class ModernTunnelManager(tk.Tk):
 
         return "\n".join(lines)
 
-    def _supervisor_payload_message(self, payload: dict, default: str) -> str:
-        return str(payload.get("message") or payload.get("stderr") or default)
-
     def _append_supervisor_payload_logs(self, payload: dict):
         logs = payload.get("logs")
         if not isinstance(logs, list):
@@ -2172,7 +2044,7 @@ class ModernTunnelManager(tk.Tk):
             self._show_dialog("守护进程状态", display)
             self._append_log(f"守护进程状态:\n{display}\n", "info")
         else:
-            error_text = str(payload.get("message") or payload.get("stderr") or "无法获取守护进程状态。")
+            error_text = self.operation_service.payload_message(payload, "无法获取守护进程状态。")
             self._show_dialog("守护进程状态", error_text, "error")
             self._append_log(f"守护进程状态查询失败: {error_text}\n", "error")
 
@@ -2807,7 +2679,7 @@ class ModernTunnelManager(tk.Tk):
             return None
 
         payload = self.supervisor_client.start_tunnel_payload(tunnel_name)
-        return self._build_supervisor_start_result(tunnel_name, payload)
+        return self.operation_service.build_supervisor_start_result(tunnel_name, payload)
 
     def _cleanup_start_residual_tunnel(self, tunnel_name: str, payload: dict):
         """直接启动前尽力清理残留进程，避免旧状态干扰。"""
@@ -2939,7 +2811,7 @@ class ModernTunnelManager(tk.Tk):
             if supervisor_result is not None:
                 return supervisor_result
 
-            payload = self._new_start_result(name, "gui")
+            payload = self.operation_service.new_start_result(name, "gui")
 
             self._cleanup_start_residual_tunnel(name, payload)
 
@@ -2987,20 +2859,12 @@ class ModernTunnelManager(tk.Tk):
                 return payload
 
             launch = self._launch_tunnel_worker(path, name, cfg, capture_output, log_file)
-            return self._build_direct_start_result(name, launch, payload)
+            return self.operation_service.build_direct_start_result(name, launch, payload)
 
         self._run_async_tunnel_operation(
             _worker,
             lambda result: self._finish_start_selected(name, result),
-            lambda exc: self._new_start_result(
-                name,
-                "gui",
-                ok=False,
-                stage="exception",
-                message=str(exc).strip(),
-                summary=str(exc).strip(),
-                error=str(exc).strip(),
-            ),
+            lambda exc: self.operation_service.build_start_exception_result(name, exc),
         )
 
     def _stop_via_supervisor_if_available(self, tunnel_name: str) -> dict | None:
@@ -3009,7 +2873,7 @@ class ModernTunnelManager(tk.Tk):
             return None
 
         payload = self.supervisor_client.stop_tunnel_payload(tunnel_name)
-        return self._build_supervisor_stop_result(tunnel_name, payload)
+        return self.operation_service.build_supervisor_stop_result(tunnel_name, payload)
 
     def _stop_tunnel_worker(self, tunnel_name: str, proc: subprocess.Popen | None) -> dict:
         """在后台执行停止逻辑，不直接操作 UI。"""
@@ -3023,7 +2887,7 @@ class ModernTunnelManager(tk.Tk):
                 self.proc_tracker.unregister(tunnel_name, expected_pid=raw_result.get("pid"))
             except Exception:
                 pass
-        return self._build_direct_stop_result(tunnel_name, raw_result)
+        return self.operation_service.build_direct_stop_result(tunnel_name, raw_result)
 
     def _handle_supervisor_stop_result(self, tunnel_name: str, result: dict) -> bool:
         """处理由 supervisor 接管的停止结果。"""
@@ -3031,7 +2895,7 @@ class ModernTunnelManager(tk.Tk):
             return False
 
         ok = bool(result.get("ok"))
-        msg = self._supervisor_payload_message(result, "停止指令已发送" if ok else "守护进程停止失败")
+        msg = self.operation_service.payload_message(result, "停止指令已发送" if ok else "守护进程停止失败")
         if not ok:
             self._append_supervisor_payload_logs(result)
 
@@ -3100,16 +2964,7 @@ class ModernTunnelManager(tk.Tk):
         self._run_async_tunnel_operation(
             lambda: self._stop_tunnel_worker(tunnel_name, proc),
             lambda result: self._finish_stop_running(tunnel_name, result),
-            lambda exc: self._new_stop_result(
-                tunnel_name,
-                "gui",
-                ok=False,
-                stage="exception",
-                message=str(exc).strip(),
-                summary=str(exc).strip(),
-                error=str(exc).strip(),
-                method="exception",
-            ),
+            lambda exc: self.operation_service.build_stop_exception_result(tunnel_name, exc),
         )
 
     def _run_tunnel_diagnostics(
