@@ -1085,7 +1085,7 @@ class ModernTunnelManager(tk.Tk):
             else:
                 self._append_log("自动启动已启用，但尚未指定隧道，请先选择一个隧道。\n", "warning")
                 self.logger.warning("自动启动缺少目标")
-                messagebox.showinfo("自动启动", "请先选择准备自动启动的隧道，然后再次启用该选项。")
+                self._show_dialog("自动启动", "请先选择准备自动启动的隧道，然后再次启用该选项。")
                 self.autostart_var.set(False)
                 self.settings.set("tunnel.auto_start_enabled", False)
                 enabled = False
@@ -1617,6 +1617,33 @@ class ModernTunnelManager(tk.Tk):
         if text:
             self._messagebox_for_level(dialog_level or tag)(title, text)
 
+    def _show_dialog(self, title: str, message: str | None, level: str = "info"):
+        text = self._normalize_feedback_text(message)
+        if not text:
+            return
+        self._messagebox_for_level(level)(title, text)
+
+    @staticmethod
+    def _confirm_dialog(title: str, message: str) -> bool:
+        return bool(messagebox.askyesno(title, message))
+
+    @staticmethod
+    def _prompt_text(title: str, prompt: str) -> str | None:
+        return simpledialog.askstring(title, prompt)
+
+    @staticmethod
+    def _choose_open_file(title: str, filetypes) -> str:
+        return filedialog.askopenfilename(title=title, filetypes=filetypes)
+
+    @staticmethod
+    def _choose_save_file(title: str, defaultextension: str, initialfile: str, filetypes) -> str:
+        return filedialog.asksaveasfilename(
+            title=title,
+            defaultextension=defaultextension,
+            initialfile=initialfile,
+            filetypes=filetypes,
+        )
+
     @staticmethod
     def _selected_tunnel_name(item: dict | None) -> str:
         return (item or {}).get("name", "unknown")
@@ -1668,11 +1695,11 @@ class ModernTunnelManager(tk.Tk):
         existing_info = self._get_running_tunnel_info(tunnel_name)
         pid_info = f" (PID: {existing_info['pid']})" if existing_info and existing_info.get("pid") else ""
         message = f"隧道 {tunnel_name} 已在运行中{pid_info}"
-        messagebox.showinfo("提示", message)
+        self._show_dialog("提示", message)
         self._record_feedback(message, "warning")
 
     def _notify_tunnel_not_running(self, tunnel_name: str):
-        messagebox.showinfo("提示", f"隧道 {tunnel_name} 未在运行")
+        self._show_dialog("提示", f"隧道 {tunnel_name} 未在运行")
 
     def _log_result_messages(self, result: dict):
         """将后台任务返回的消息和警告统一写入日志。"""
@@ -2162,7 +2189,7 @@ class ModernTunnelManager(tk.Tk):
     def _show_supervisor_status(self):
         """弹窗展示守护进程状态"""
         if not self._supervisor_available:
-            messagebox.showinfo(
+            self._show_dialog(
                 "守护进程状态",
                 "未检测到 tunnel_supervisor，可通过“部署 Supervisor”脚本启用。"
             )
@@ -2172,11 +2199,11 @@ class ModernTunnelManager(tk.Tk):
         ok = bool(payload.get("ok"))
         if ok:
             display = self._format_supervisor_status_payload(payload)
-            messagebox.showinfo("守护进程状态", display)
+            self._show_dialog("守护进程状态", display)
             self._append_log(f"守护进程状态:\n{display}\n", "info")
         else:
             error_text = str(payload.get("message") or payload.get("stderr") or "无法获取守护进程状态。")
-            messagebox.showerror("守护进程状态", error_text)
+            self._show_dialog("守护进程状态", error_text, "error")
             self._append_log(f"守护进程状态查询失败: {error_text}\n", "error")
 
     def _can_control_tunnel(self, tunnel_name: str | None) -> bool:
@@ -2186,9 +2213,10 @@ class ModernTunnelManager(tk.Tk):
 
         if self._supervisor_active:
             if not self._supervisor_available:
-                messagebox.showwarning(
+                self._show_dialog(
                     "守护进程限制",
-                    "检测到隧道守护进程正在运行，但 GUI 无法与其通信，请先停止 tunnel_supervisor。"
+                    "检测到隧道守护进程正在运行，但 GUI 无法与其通信，请先停止 tunnel_supervisor。",
+                    "warning",
                 )
                 return False
             # 守护进程已连接，可继续操作（交由守护进程执行）
@@ -2199,10 +2227,11 @@ class ModernTunnelManager(tk.Tk):
             return True
 
         if record.alive and record.manager not in {"modern_gui", "gui"}:
-            messagebox.showerror(
+            self._show_dialog(
                 "管理冲突",
                 f"隧道 {tunnel_name} 正由 {record.manager} 管理 (PID: {record.pid})。\n"
-                "请先停止对应进程或通过守护进程接口进行操作。"
+                "请先停止对应进程或通过守护进程接口进行操作。",
+                "error",
             )
             return False
 
@@ -2499,10 +2528,7 @@ class ModernTunnelManager(tk.Tk):
 
     def _choose_cloudflared(self):
         """选择 cloudflared 可执行文件"""
-        path = filedialog.askopenfilename(
-            title="选择 cloudflared 可执行文件",
-            filetypes=self.binary_service.selectable_filetypes()
-        )
+        path = self._choose_open_file("选择 cloudflared 可执行文件", self.binary_service.selectable_filetypes())
         if path:
             self.cloudflared_path.set(path)
             self.settings.set("cloudflared.path", path)
@@ -2545,15 +2571,14 @@ class ModernTunnelManager(tk.Tk):
                     self.settings.set("cloudflared.path", str(result.target_path))
                     self._refresh_version()
                     self._record_feedback(f"{result.message}{extra}", "success")
-                    dialog = messagebox.showinfo if cert_ok else messagebox.showwarning
                     title = success_label if cert_ok else f"{success_label}（需登录）"
-                    dialog(title, result.message + extra + cert_append)
+                    self._show_dialog(title, result.message + extra + cert_append, "info" if cert_ok else "warning")
                     tag = "success" if cert_ok else "warning"
                     self._record_feedback(cert_detail, tag)
                     self.status_var.set(success_label if cert_ok else "缺少认证")
                 else:
                     self._record_feedback(result.message, "error")
-                    messagebox.showerror(f"{fail_label}", result.message + cert_append)
+                    self._show_dialog(f"{fail_label}", result.message + cert_append, "error")
                     tag = "success" if cert_ok else "warning"
                     self._record_feedback(cert_detail, tag)
                     self.status_var.set(fail_label)
@@ -2565,7 +2590,7 @@ class ModernTunnelManager(tk.Tk):
 
     def _confirm_replace_origin_cert(self, cert_path: Path) -> bool:
         """确认是否删除现有认证并重新登录。"""
-        response = messagebox.askyesno(
+        response = self._confirm_dialog(
             "已存在认证",
             "检测到已存在 Cloudflare 认证文件。\n"
             f"路径：{cert_path}\n\n"
@@ -2652,7 +2677,7 @@ class ModernTunnelManager(tk.Tk):
                     error_text = result.error or "cloudflared 不可用"
                     self._append_log(f"刷新隧道失败: {error_text}\n", "error")
                     self.logger.error(f"刷新隧道失败: {error_text}")
-                    messagebox.showerror("cloudflared 不可用", error_text)
+                    self._show_dialog("cloudflared 不可用", error_text, "error")
                     self.status_var.set("cloudflared 不可用")
                     self.tunnel_list.set_tunnels([], "加载失败", "请检查 cloudflared 是否可执行，或重新选择可执行文件。")
                     return
@@ -2714,12 +2739,12 @@ class ModernTunnelManager(tk.Tk):
 
         cert = self.auth_service.find_origin_cert(None)
         if cert is None:
-            messagebox.showerror("缺少认证", '未找到 Cloudflare 认证证书 cert.pem，请先点击"登录"完成授权。')
+            self._show_dialog("缺少认证", '未找到 Cloudflare 认证证书 cert.pem，请先点击"登录"完成授权。', "error")
             self._append_log("未找到 cert.pem，请先运行登录\n", "warning")
             self.logger.warning("未找到认证证书，无法创建隧道")
             return
 
-        name = simpledialog.askstring("新建隧道", "请输入隧道名称:")
+        name = self._prompt_text("新建隧道", "请输入隧道名称:")
         if not name:
             return
 
@@ -2748,7 +2773,7 @@ class ModernTunnelManager(tk.Tk):
             return
 
         name = self._selected_tunnel_name(item)
-        if not messagebox.askyesno("确认删除", f"确定要删除隧道 '{name}' 吗？\n此操作不可恢复。"):
+        if not self._confirm_dialog("确认删除", f"确定要删除隧道 '{name}' 吗？\n此操作不可恢复。"):
             return
 
         self._append_log(f"正在删除隧道: {name}...\n", "warning")
@@ -3197,14 +3222,14 @@ class ModernTunnelManager(tk.Tk):
 
     def _prompt_route_dns_hostname(self) -> str | None:
         """提示用户输入要绑定的 DNS 主机名，并做基础校验。"""
-        hostname = simpledialog.askstring("DNS 路由", "输入要绑定的主机名 (例如: app.example.com)")
+        hostname = self._prompt_text("DNS 路由", "输入要绑定的主机名 (例如: app.example.com)")
         if not hostname:
             return None
 
         normalized = hostname.strip()
         error = self.dns_service.validate_hostname(normalized)
         if error:
-            messagebox.showerror("主机名无效", error)
+            self._show_dialog("主机名无效", error, "error")
             self._append_log(f"DNS 路由输入无效: {error}\n", "error")
             self.logger.error(f"DNS 路由输入无效: {error}")
             return None
@@ -3214,18 +3239,19 @@ class ModernTunnelManager(tk.Tk):
         """统一处理手动 DNS 路由的结果展示。"""
         if ok:
             self._record_feedback(f"DNS 路由配置成功: {hostname} -> {tunnel_name}", "success")
-            messagebox.showinfo("成功", f"已为 {tunnel_name} 绑定 {hostname}")
+            self._show_dialog("成功", f"已为 {tunnel_name} 绑定 {hostname}")
             return
 
         self._record_feedback(f"DNS 路由失败: {output}", "error")
         if "already exists" in output:
-            messagebox.showerror(
+            self._show_dialog(
                 "DNS记录已存在",
                 f"DNS记录 {hostname} 已存在！\n\n"
-                "请使用不同的子域名或在Cloudflare控制台删除现有记录。"
+                "请使用不同的子域名或在Cloudflare控制台删除现有记录。",
+                "error",
             )
             return
-        messagebox.showerror("失败", output)
+        self._show_dialog("失败", output, "error")
 
     def _route_dns_selected(self):
         """配置DNS路由"""
@@ -3261,7 +3287,7 @@ class ModernTunnelManager(tk.Tk):
             self._append_log(f"已打开配置目录: {config_dir}\n", "info")
             self.logger.info(f"已打开配置目录: {config_dir}")
         except Exception:
-            messagebox.showinfo("配置目录", f"配置目录位置:\n{config_dir}")
+            self._show_dialog("配置目录", f"配置目录位置:\n{config_dir}")
 
     def _append_log(self, text: str, tag: str | None = None, *, autoscroll: bool | None = None, trim: bool = True):
         """添加日志"""
@@ -3328,7 +3354,7 @@ class ModernTunnelManager(tk.Tk):
             return
         text = self.log.get(1.0, tk.END).strip()
         if not text:
-            messagebox.showinfo("复制日志", "暂无日志可复制。")
+            self._show_dialog("复制日志", "暂无日志可复制。")
             return
         self.clipboard_clear()
         self.clipboard_append(text)
@@ -3340,23 +3366,18 @@ class ModernTunnelManager(tk.Tk):
             return
         text = self.log.get(1.0, tk.END).strip()
         if not text:
-            messagebox.showinfo("保存日志", "暂无日志可保存。")
+            self._show_dialog("保存日志", "暂无日志可保存。")
             return
         default_name = f"cloudflared-log-{datetime.now().strftime('%Y%m%d-%H%M%S')}.log"
-        file_path = filedialog.asksaveasfilename(
-            title="保存日志",
-            defaultextension=".log",
-            initialfile=default_name,
-            filetypes=[("日志文件", "*.log"), ("所有文件", "*.*")]
-        )
+        file_path = self._choose_save_file("保存日志", ".log", default_name, [("日志文件", "*.log"), ("所有文件", "*.*")])
         if not file_path:
             return
         try:
             Path(file_path).write_text(text + "\n", encoding="utf-8")
-            messagebox.showinfo("保存成功", f"日志已保存到:\n{file_path}")
+            self._show_dialog("保存成功", f"日志已保存到:\n{file_path}")
             self.logger.info(f"日志已保存到: {file_path}")
         except Exception as exc:
-            messagebox.showerror("保存失败", str(exc))
+            self._show_dialog("保存失败", str(exc), "error")
             self.logger.error(f"日志保存失败: {exc}")
 
     def _toggle_start_selected(self):
