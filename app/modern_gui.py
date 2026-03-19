@@ -9,9 +9,6 @@ from tkinter import ttk, messagebox, filedialog, simpledialog
 import threading
 from pathlib import Path
 import queue
-import platform
-import urllib.request
-import urllib.error
 import os
 import json
 import subprocess
@@ -24,42 +21,44 @@ from typing import Callable
 # 支持包模式和脚本模式运行
 try:
     # 包模式导入
-    from . import cloudflared_cli as cf
     from .services import (
         AuthService,
+        CloudflaredBinaryService,
         DnsRouteService,
         TunnelCatalogLoadResult,
         TunnelCatalogService,
         TunnelConfigService,
         TunnelDiagnosticsService,
         TunnelLifecycleService,
+        TunnelRuntimeService,
     )
     from .utils.theme import Theme
     from .components.widgets import ModernButton, IconButton, Card, Badge, StatusIndicator, SearchBox
     from .config.settings import Settings
     from .utils.logger import LogManager, LogLevel
-    from .utils.paths import get_repo_root, get_logs_dir, get_persistent_logs_dir, get_tunnels_dir
+    from .utils.paths import get_logs_dir, get_persistent_logs_dir, get_tunnels_dir
     from .utils.process_tracker import ProcessTracker, SupervisorLock
     from .utils.supervisor_client import SupervisorClient
 except (ImportError, ValueError):
     # 脚本模式导入
     import sys
     sys.path.append(os.path.dirname(__file__))
-    import cloudflared_cli as cf
     from services import (
         AuthService,
+        CloudflaredBinaryService,
         DnsRouteService,
         TunnelCatalogLoadResult,
         TunnelCatalogService,
         TunnelConfigService,
         TunnelDiagnosticsService,
         TunnelLifecycleService,
+        TunnelRuntimeService,
     )
     from utils.theme import Theme
     from components.widgets import ModernButton, IconButton, Card, Badge, StatusIndicator, SearchBox
     from config.settings import Settings
     from utils.logger import LogManager, LogLevel
-    from utils.paths import get_repo_root, get_logs_dir, get_persistent_logs_dir, get_tunnels_dir
+    from utils.paths import get_logs_dir, get_persistent_logs_dir, get_tunnels_dir
     from utils.process_tracker import ProcessTracker, SupervisorLock
     from utils.supervisor_client import SupervisorClient
 
@@ -482,12 +481,14 @@ class ModernTunnelManager(tk.Tk):
         self.configure(bg=Theme.BG_MAIN)
 
         # 初始化变量
+        self._project_root = Path(__file__).resolve().parent.parent
+        self.binary_service = CloudflaredBinaryService(self._project_root)
+        self.runtime_service = TunnelRuntimeService(self.binary_service)
         self.cloudflared_path = tk.StringVar(
-            value=self.settings.get("cloudflared.path") or cf.find_cloudflared() or ""
+            value=self.settings.get("cloudflared.path") or self.binary_service.resolve_path() or ""
         )
         self.status_var = tk.StringVar(value="就绪")
         self.search_var = tk.StringVar()
-        self._project_root = Path(__file__).resolve().parent.parent
         self.proc_tracker = ProcessTracker(self._project_root)
         self.supervisor_lock = SupervisorLock(self._project_root)
         self._supervisor_active = False
@@ -630,7 +631,7 @@ class ModernTunnelManager(tk.Tk):
         else:
             for name, proc in active_procs:
                 try:
-                    cf.stop_process(proc)
+                    self.runtime_service.stop_process(proc)
                     self.proc_tracker.unregister(name, expected_pid=proc.pid)
                 except Exception:
                     pass
@@ -1313,19 +1314,14 @@ class ModernTunnelManager(tk.Tk):
 
     def _health_status(self, tunnel_name: str, force: bool = False) -> tuple[bool | None, str]:
         """获取隧道活跃连接状态，使用短期缓存避免频繁调用 cloudflared。"""
-        now = time.time()
-        cached = self._health_cache.get(tunnel_name)
-        if cached and not force and now - cached.get("ts", 0) < 10:
-            return cached.get("ok"), cached.get("detail", "")
-
-        path = self.cloudflared_path.get().strip() or cf.find_cloudflared()
-        if not path:
-            self._health_cache[tunnel_name] = {"ok": None, "detail": "未配置 cloudflared 路径", "ts": now}
-            return None, "未配置 cloudflared 路径"
-
-        ok, detail = cf.test_connection(path, tunnel_name, timeout=20)
-        self._health_cache[tunnel_name] = {"ok": ok, "detail": detail, "ts": now}
-        return ok, detail
+        return self.runtime_service.get_health_status(
+            tunnel_name,
+            self.cloudflared_path.get().strip(),
+            self._health_cache,
+            ttl=10,
+            timeout=20,
+            force=force,
+        )
 
     def _handle_auto_heal(self, tunnel_name: str, ok: bool | None, detail: str):
         """检测到无活跃连接时自动重启 GUI 管理的隧道"""
@@ -1380,7 +1376,7 @@ class ModernTunnelManager(tk.Tk):
                 self.logger.warning(f"自动重连：{tunnel_name} 无活跃连接，准备重启 ({notice})")
                 self.status_var.set(f"自动重连 {tunnel_name}…")
                 persist_flag = bool(self.persist_var.get())
-                path = self.cloudflared_path.get().strip() or cf.find_cloudflared()
+                path = self.runtime_service.resolve_cloudflared_path(self.cloudflared_path.get().strip())
                 self.after(100, lambda n=tunnel_name, p=persist_flag, c=path: self._restart_gui_tunnel(n, cloudflared_path=c, persist_enabled=p))
         else:
             self._health_failures.pop(tunnel_name, None)
@@ -1414,7 +1410,7 @@ class ModernTunnelManager(tk.Tk):
 
         # 启动后台线程执行耗时操作
         self._status_refresh_running = True
-        cloudflared_path = self.cloudflared_path.get().strip() or cf.find_cloudflared()
+        cloudflared_path = self.runtime_service.resolve_cloudflared_path(self.cloudflared_path.get().strip())
         threading.Thread(
             target=self._background_status_check,
             args=(cloudflared_path,),
@@ -1424,35 +1420,14 @@ class ModernTunnelManager(tk.Tk):
     def _background_status_check(self, cloudflared_path: str | None):
         """后台线程：执行耗时的状态检查操作"""
         try:
-            # 获取运行中的隧道列表（执行 ps 命令）
-            running_tunnels_list = cf.get_running_tunnels()
-
-            # 补充健康检查信息（执行 cloudflared tunnel info）
             cache_ttl = int(self.settings.get("tunnel.health_cache_ttl", 30) or 30)
             test_timeout = int(self.settings.get("tunnel.health_check_timeout", 12) or 12)
-            for t in running_tunnels_list:
-                tunnel_name = t["name"]
-                # 使用缓存减少调用次数
-                now = time.time()
-                cached = self._health_cache.get(tunnel_name)
-                if cached and now - cached.get("ts", 0) < cache_ttl:
-                    ok, detail = cached.get("ok"), cached.get("detail", "")
-                else:
-                    if cloudflared_path:
-                        ok, detail = cf.test_connection(cloudflared_path, tunnel_name, timeout=test_timeout)
-                        self._health_cache[tunnel_name] = {"ok": ok, "detail": detail, "ts": now}
-                    else:
-                        ok, detail = None, "未配置 cloudflared 路径"
-
-                if ok is True:
-                    t["healthy"] = True
-                elif ok is False:
-                    t["healthy"] = False
-                else:
-                    t["healthy"] = None
-                if detail:
-                    t["detail"] = detail
-                t["_health_ok"] = ok  # 临时存储用于主线程处理
+            running_tunnels_list = self.runtime_service.get_running_tunnels_with_health(
+                cloudflared_path,
+                self._health_cache,
+                cache_ttl=cache_ttl,
+                timeout=test_timeout,
+            )
 
             # 将结果传回主线程处理
             self.after(0, lambda data=running_tunnels_list: self._apply_status_update(data))
@@ -1547,7 +1522,7 @@ class ModernTunnelManager(tk.Tk):
         try:
             proc = self.proc_map.get(tunnel_name)
             if proc and proc.poll() is None:
-                cf.stop_process(proc)
+                self.runtime_service.stop_process(proc)
                 stop_pid = proc.pid
         except Exception as exc:
             self.after(0, lambda e=exc: self._append_log(f"自动重连停止阶段异常: {e}\n", "error"))
@@ -1914,7 +1889,7 @@ class ModernTunnelManager(tk.Tk):
             self._auto_heal_pending.discard(tunnel_name)
             return
 
-        path = cloudflared_path or (self.cloudflared_path.get().strip() or cf.find_cloudflared())
+        path = cloudflared_path or self.runtime_service.resolve_cloudflared_path(self.cloudflared_path.get().strip())
         if not path:
             self._append_log("自动重连失败：未设置 cloudflared 路径\n", "error")
             self.logger.error("自动重连失败：未设置 cloudflared 路径")
@@ -2416,7 +2391,7 @@ class ModernTunnelManager(tk.Tk):
         """选择 cloudflared 可执行文件"""
         path = filedialog.askopenfilename(
             title="选择 cloudflared 可执行文件",
-            filetypes=[("可执行文件", "*.exe"), ("所有文件", "*.*")] if cf._is_windows() else [("所有文件", "*")]
+            filetypes=self.binary_service.selectable_filetypes()
         )
         if path:
             self.cloudflared_path.set(path)
@@ -2436,8 +2411,6 @@ class ModernTunnelManager(tk.Tk):
 
     def _run_download_flow(self, mode: str):
         """共享的下载/更新流程"""
-        target_name = "cloudflared.exe" if cf._is_windows() else "cloudflared"
-        target = get_repo_root() / target_name
         start_log = "正在检查 cloudflared 更新...\n" if mode == "update" else "正在下载 cloudflared...\n"
         busy_status = "检查更新中…" if mode == "update" else "下载准备中…"
         success_label = "更新完成" if mode == "update" else "下载完成"
@@ -2451,28 +2424,28 @@ class ModernTunnelManager(tk.Tk):
             self.after(0, lambda: self.status_var.set(f"下载中… {pct}%"))
 
         def _worker():
-            ok, msg, version = cf.download_cloudflared(target, progress_cb=progress)
+            result = self.binary_service.download_binary(progress_cb=progress)
 
             def _finish():
                 cert_ok, _, cert_detail = self._cert_status_summary()
                 cert_append = f"\n\n证书状态：\n{cert_detail}"
-                extra = f"\n版本: {version}" if version else ""
-                if ok:
-                    self.cloudflared_path.set(str(target))
-                    self.settings.set("cloudflared.path", str(target))
+                extra = f"\n版本: {result.version}" if result.version else ""
+                if result.ok:
+                    self.cloudflared_path.set(str(result.target_path))
+                    self.settings.set("cloudflared.path", str(result.target_path))
                     self._refresh_version()
-                    self._append_log(f"{msg}{extra}\n", "success")
-                    self.logger.info(f"{msg}{extra}")
+                    self._append_log(f"{result.message}{extra}\n", "success")
+                    self.logger.info(f"{result.message}{extra}")
                     dialog = messagebox.showinfo if cert_ok else messagebox.showwarning
                     title = success_label if cert_ok else f"{success_label}（需登录）"
-                    dialog(title, msg + extra + cert_append)
+                    dialog(title, result.message + extra + cert_append)
                     tag = "success" if cert_ok else "warning"
                     self._append_log(cert_detail + "\n", tag)
                     self.status_var.set(success_label if cert_ok else "缺少认证")
                 else:
-                    self._append_log(f"{msg}\n", "error")
-                    self.logger.error(msg)
-                    messagebox.showerror(f"{fail_label}", msg + cert_append)
+                    self._append_log(f"{result.message}\n", "error")
+                    self.logger.error(result.message)
+                    messagebox.showerror(f"{fail_label}", result.message + cert_append)
                     tag = "success" if cert_ok else "warning"
                     self._append_log(cert_detail + "\n", tag)
                     self.status_var.set(fail_label)
@@ -2542,17 +2515,10 @@ class ModernTunnelManager(tk.Tk):
     def _refresh_version(self):
         """刷新版本信息"""
         path = self.cloudflared_path.get().strip()
-        if not path:
-            self.version_label.config(text="Cloudflared: 未安装")
-            return
-        ver = cf.version(path)
-        if ver:
-            # 简化版本显示
-            ver_short = ver.split("(")[0].strip() if "(" in ver else ver
-            self.version_label.config(text=f"Cloudflared: {ver_short}")
-            self.logger.debug(f"Cloudflared 版本: {ver_short}")
-        else:
-            self.version_label.config(text="Cloudflared: 版本未知")
+        info = self.binary_service.version_info(path)
+        self.version_label.config(text=info.display_text)
+        if info.short_version:
+            self.logger.debug(f"Cloudflared 版本: {info.short_version}")
 
     def refresh_tunnels(self):
         """刷新隧道列表"""
@@ -2787,7 +2753,7 @@ class ModernTunnelManager(tk.Tk):
 
         if not self._can_control_tunnel(name):
             return
-        tid = cf.extract_tunnel_id(item)
+        tid = self.runtime_service.extract_tunnel_id(item)
 
         if not tid:
             messagebox.showerror("错误", "无法获取隧道ID")
@@ -2834,7 +2800,7 @@ class ModernTunnelManager(tk.Tk):
             self.logger.warning(f"隧道 {name} 已在运行中")
             return
 
-        tid = cf.extract_tunnel_id(item)
+        tid = self.runtime_service.extract_tunnel_id(item)
         if not tid:
             self._append_log("无法获取隧道ID\n", "error")
             self.logger.error("无法获取隧道ID")
@@ -3098,7 +3064,7 @@ class ModernTunnelManager(tk.Tk):
             return
 
         name = item.get("name", "unknown")
-        tid = cf.extract_tunnel_id(item)
+        tid = self.runtime_service.extract_tunnel_id(item)
         cfg = self._config_path_for(name)
 
         dialog = tk.Toplevel(self)
@@ -3212,7 +3178,7 @@ class ModernTunnelManager(tk.Tk):
         config_dir.mkdir(parents=True, exist_ok=True)
 
         try:
-            if cf._is_windows():
+            if self.binary_service.is_windows():
                 os.startfile(str(config_dir))
             else:
                 import subprocess
