@@ -1617,6 +1617,63 @@ class ModernTunnelManager(tk.Tk):
         if text:
             self._messagebox_for_level(dialog_level or tag)(title, text)
 
+    @staticmethod
+    def _selected_tunnel_name(item: dict | None) -> str:
+        return (item or {}).get("name", "unknown")
+
+    def _require_cloudflared_path(
+        self,
+        *,
+        title: str = "错误",
+        message: str = "请先设置 cloudflared 路径",
+        level: str = "error",
+    ) -> str | None:
+        path = self.cloudflared_path.get().strip()
+        if path:
+            return path
+        self._messagebox_for_level(level)(title, message)
+        return None
+
+    def _require_selected_tunnel(
+        self,
+        *,
+        title: str = "提示",
+        message: str = "请先选择一个隧道",
+        level: str = "info",
+    ) -> dict | None:
+        item = self.tunnel_list.get_selected()
+        if item:
+            return item
+        self._messagebox_for_level(level)(title, message)
+        return None
+
+    def _require_tunnel_id(
+        self,
+        item: dict,
+        *,
+        title: str = "错误",
+        message: str = "无法获取隧道ID",
+        level: str = "error",
+        log: bool = False,
+    ) -> str | None:
+        tunnel_id = self.runtime_service.extract_tunnel_id(item)
+        if tunnel_id:
+            return tunnel_id
+        if log:
+            self._record_feedback(message, level)
+        self._messagebox_for_level(level)(title, message)
+        return None
+
+    def _notify_tunnel_running(self, tunnel_name: str):
+        existing_info = self._get_running_tunnel_info(tunnel_name)
+        pid_info = f" (PID: {existing_info['pid']})" if existing_info and existing_info.get("pid") else ""
+        message = f"隧道 {tunnel_name} 已在运行中{pid_info}"
+        messagebox.showinfo("提示", message)
+        self._record_feedback(message, "warning")
+
+    def _notify_tunnel_not_running(self, tunnel_name: str):
+        messagebox.showinfo("提示", f"隧道 {tunnel_name} 未在运行")
+
     def _log_result_messages(self, result: dict):
         """将后台任务返回的消息和警告统一写入日志。"""
         self._record_feedback_lines(result.get("messages", []), "info")
@@ -2546,9 +2603,8 @@ class ModernTunnelManager(tk.Tk):
 
     def _login(self):
         """登录 Cloudflare"""
-        path = self.cloudflared_path.get().strip()
+        path = self._require_cloudflared_path()
         if not path:
-            messagebox.showerror("错误", "请先设置 cloudflared 路径")
             return
 
         cert_path = self.auth_service.find_origin_cert(None)
@@ -2652,9 +2708,8 @@ class ModernTunnelManager(tk.Tk):
 
     def _create_tunnel(self):
         """创建新隧道"""
-        path = self.cloudflared_path.get().strip()
+        path = self._require_cloudflared_path()
         if not path:
-            messagebox.showerror("错误", "请先设置 cloudflared 路径")
             return
 
         cert = self.auth_service.find_origin_cert(None)
@@ -2684,14 +2739,15 @@ class ModernTunnelManager(tk.Tk):
 
     def _delete_selected(self):
         """删除选中的隧道"""
-        path = self.cloudflared_path.get().strip()
-        item = self.tunnel_list.get_selected()
-
-        if not (path and item):
-            messagebox.showwarning("提示", "请先选择要删除的隧道")
+        path = self._require_cloudflared_path()
+        if not path:
             return
 
-        name = item.get("name", "")
+        item = self._require_selected_tunnel(message="请先选择要删除的隧道", level="warning")
+        if not item:
+            return
+
+        name = self._selected_tunnel_name(item)
         if not messagebox.askyesno("确认删除", f"确定要删除隧道 '{name}' 吗？\n此操作不可恢复。"):
             return
 
@@ -2775,19 +2831,16 @@ class ModernTunnelManager(tk.Tk):
 
     def _edit_selected_config(self):
         """编辑配置（使用内置编辑器）"""
-        item = self.tunnel_list.get_selected()
+        item = self._require_selected_tunnel()
         if not item:
-            messagebox.showinfo("提示", "请先选择一个隧道")
             return
 
-        name = item.get("name", "unknown")
+        name = self._selected_tunnel_name(item)
 
         if not self._can_control_tunnel(name):
             return
-        tid = self.runtime_service.extract_tunnel_id(item)
-
+        tid = self._require_tunnel_id(item)
         if not tid:
-            messagebox.showerror("错误", "无法获取隧道ID")
             return
 
         cfg = self._config_path_for(name)
@@ -2811,30 +2864,25 @@ class ModernTunnelManager(tk.Tk):
 
         self._refresh_proc_state()
 
-        path = self.cloudflared_path.get().strip()
-        item = self.tunnel_list.get_selected()
-
-        if not (path and item):
-            messagebox.showwarning("提示", "请先选择要启动的隧道")
+        path = self._require_cloudflared_path()
+        if not path:
             return
 
-        name = item.get("name", "unknown")
+        item = self._require_selected_tunnel(message="请先选择要启动的隧道", level="warning")
+        if not item:
+            return
+
+        name = self._selected_tunnel_name(item)
         if not self._can_control_tunnel(name):
             return
 
         # 已在运行则不重复启动
         if self._is_tunnel_running(name):
-            existing_info = self._get_running_tunnel_info(name)
-            pid_info = f" (PID: {existing_info['pid']})" if existing_info and existing_info.get("pid") else ""
-            messagebox.showinfo("提示", f"隧道 {name} 已在运行中{pid_info}")
-            self._append_log(f"隧道 {name} 已在运行中{pid_info}\n", "warning")
-            self.logger.warning(f"隧道 {name} 已在运行中")
+            self._notify_tunnel_running(name)
             return
 
-        tid = self.runtime_service.extract_tunnel_id(item)
+        tid = self._require_tunnel_id(item, log=True)
         if not tid:
-            self._append_log("无法获取隧道ID\n", "error")
-            self.logger.error("无法获取隧道ID")
             return
 
         persist_enabled = bool(self.persist_var.get())
@@ -3008,18 +3056,17 @@ class ModernTunnelManager(tk.Tk):
         if self._tunnel_operation_in_progress:
             return
 
-        selected = self.tunnel_list.get_selected()
+        selected = self._require_selected_tunnel(message="请先选择要停止的隧道")
         if not selected:
-            messagebox.showinfo("提示", "请先选择要停止的隧道")
             return
 
-        tunnel_name = selected.get("name", "unknown")
+        tunnel_name = self._selected_tunnel_name(selected)
 
         if not self._can_control_tunnel(tunnel_name):
             return
 
         if not self._is_tunnel_running(tunnel_name):
-            messagebox.showinfo("提示", f"隧道 {tunnel_name} 未在运行")
+            self._notify_tunnel_not_running(tunnel_name)
             return
 
         self._tunnel_operation_in_progress = True
@@ -3084,17 +3131,15 @@ class ModernTunnelManager(tk.Tk):
 
     def _test_tunnel(self):
         """测试隧道（内置诊断）"""
-        path = self.cloudflared_path.get().strip()
+        path = self._require_cloudflared_path(title="提示", message="请先设置 cloudflared 路径", level="warning")
         if not path:
-            messagebox.showwarning("提示", "请先设置 cloudflared 路径")
             return
 
-        item = self.tunnel_list.get_selected()
+        item = self._require_selected_tunnel(level="warning")
         if not item:
-            messagebox.showwarning("提示", "请先选择一个隧道")
             return
 
-        name = item.get("name", "unknown")
+        name = self._selected_tunnel_name(item)
         tid = self.runtime_service.extract_tunnel_id(item)
         cfg = self._config_path_for(name)
 
@@ -3184,14 +3229,15 @@ class ModernTunnelManager(tk.Tk):
 
     def _route_dns_selected(self):
         """配置DNS路由"""
-        path = self.cloudflared_path.get().strip()
-        item = self.tunnel_list.get_selected()
-
-        if not (path and item):
-            messagebox.showinfo("提示", "请先选择隧道")
+        path = self._require_cloudflared_path()
+        if not path:
             return
 
-        name = item.get("name", "")
+        item = self._require_selected_tunnel(message="请先选择隧道")
+        if not item:
+            return
+
+        name = self._selected_tunnel_name(item)
         hostname = self._prompt_route_dns_hostname()
         if not hostname:
             return
