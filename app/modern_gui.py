@@ -522,6 +522,9 @@ class ModernTunnelManager(tk.Tk):
         self.persist_var = tk.BooleanVar(value=self.settings.get("tunnel.persist_on_exit", False))
         self.autostart_var = tk.BooleanVar(value=self.settings.get("tunnel.auto_start_enabled", False))
         self.autostart_hint_var = tk.StringVar()
+        self.setup_cloudflared_var = tk.StringVar(value="工具状态：正在检查 cloudflared…")
+        self.setup_auth_var = tk.StringVar(value="登录状态：正在检查 Cloudflare 认证…")
+        self.setup_next_step_var = tk.StringVar(value="下一步：启动后将自动给出建议。")
         self._auto_start_done = False
         self._refresh_autostart_hint()
         # 自动重连默认关闭，避免误杀稳定隧道
@@ -708,6 +711,15 @@ class ModernTunnelManager(tk.Tk):
         toolbar = tk.Frame(topbar, bg=Theme.BG_TOOLBAR)
         toolbar.pack(side=tk.RIGHT, padx=20, fill=tk.Y)
 
+        self.header_hint_label = tk.Label(
+            toolbar,
+            text="准备工具 → 登录授权 → 选择隧道 → 启动",
+            bg=Theme.BG_TOOLBAR,
+            fg=Theme.TEXT_MUTED,
+            font=(Theme.FONT_FAMILY, 9)
+        )
+        self.header_hint_label.pack(side=tk.RIGHT, padx=(0, 16))
+
         # 版本信息（简洁显示）
         self.version_label = tk.Label(
             toolbar,
@@ -716,16 +728,7 @@ class ModernTunnelManager(tk.Tk):
             fg=Theme.TEXT_MUTED,
             font=(Theme.FONT_FAMILY, 9)
         )
-        self.version_label.pack(side=tk.RIGHT, padx=(15, 0))
-
-        # 工具按钮组（更紧凑的设计）
-        tool_buttons = tk.Frame(toolbar, bg=Theme.BG_TOOLBAR)
-        tool_buttons.pack(side=tk.RIGHT)
-
-        self._create_icon_button(tool_buttons, "📊", self._show_supervisor_status, "守护进程状态")
-        self._create_icon_button(tool_buttons, "🔑", self._login, "登录认证")
-        self._create_icon_button(tool_buttons, "⬇", self._download_cloudflared, "下载工具")
-        self._create_icon_button(tool_buttons, "📁", self._choose_cloudflared, "选择文件")
+        self.version_label.pack(side=tk.RIGHT)
 
         # ========== 主内容区 ==========
         main_container = tk.Frame(self, bg=Theme.BG_MAIN)
@@ -748,17 +751,9 @@ class ModernTunnelManager(tk.Tk):
             font=(Theme.FONT_FAMILY, 16, "bold")
         ).pack(side=tk.LEFT)
 
-        # 快捷操作按钮
-        quick_actions = tk.Frame(list_header, bg=Theme.BG_MAIN)
-        quick_actions.pack(side=tk.RIGHT)
-
-        self._create_compact_button(quick_actions, "🔄", self.refresh_tunnels, Theme.INFO, "刷新")
-        self._create_compact_button(quick_actions, "➕", self._create_tunnel, Theme.SUCCESS, "新建")
-        self._create_compact_button(quick_actions, "🗑", self._delete_selected, Theme.ERROR, "删除")
-
         # 搜索输入框
         search_wrapper = tk.Frame(list_header, bg=Theme.BG_MAIN)
-        search_wrapper.pack(side=tk.RIGHT, padx=(0, 10))
+        search_wrapper.pack(side=tk.RIGHT)
 
         search_box = tk.Frame(
             search_wrapper,
@@ -821,9 +816,70 @@ class ModernTunnelManager(tk.Tk):
         right_panel = tk.Frame(main_container, bg=Theme.BG_MAIN)
         right_panel.pack(side=tk.LEFT, fill=tk.BOTH, expand=True, padx=(10, 20), pady=20)
 
-        # 控制卡片
-        control_section = tk.Frame(right_panel, bg=Theme.BG_MAIN)
-        control_section.pack(fill=tk.X, pady=(0, 15))
+        setup_card = self._create_modern_card(right_panel, "首次使用", icon="🧭")
+        setup_card["card"].pack(fill=tk.X, pady=(0, 15))
+
+        tk.Label(
+            setup_card["content"],
+            text="普通用户通常只需要先准备工具并完成登录，后续选择隧道后点击启动即可。",
+            bg=Theme.BG_CARD,
+            fg=Theme.TEXT_MUTED,
+            font=(Theme.FONT_FAMILY, 9),
+            wraplength=620,
+            justify=tk.LEFT
+        ).pack(anchor="w", pady=(0, 10))
+
+        setup_actions_row = tk.Frame(setup_card["content"], bg=Theme.BG_CARD)
+        setup_actions_row.pack(fill=tk.X)
+
+        self._create_outline_button(setup_actions_row, "⬇ 下载/更新", self._check_update_cloudflared)
+        self._create_outline_button(setup_actions_row, "📁 选择文件", self._choose_cloudflared)
+        self._create_outline_button(setup_actions_row, "🔑 登录授权", self._login)
+
+        setup_state_box = tk.Frame(
+            setup_card["content"],
+            bg=Theme.BG_HOVER,
+            highlightbackground=Theme.BORDER,
+            highlightthickness=1,
+            padx=12,
+            pady=10
+        )
+        setup_state_box.pack(fill=tk.X, pady=(12, 0))
+
+        tk.Label(
+            setup_state_box,
+            textvariable=self.setup_cloudflared_var,
+            bg=Theme.BG_HOVER,
+            fg=Theme.TEXT_PRIMARY,
+            font=(Theme.FONT_FAMILY, 10, "bold"),
+            anchor="w",
+            justify=tk.LEFT
+        ).pack(fill=tk.X)
+
+        tk.Label(
+            setup_state_box,
+            textvariable=self.setup_auth_var,
+            bg=Theme.BG_HOVER,
+            fg=Theme.TEXT_SECONDARY,
+            font=(Theme.FONT_FAMILY, 9),
+            anchor="w",
+            justify=tk.LEFT
+        ).pack(fill=tk.X, pady=(6, 0))
+
+        tk.Label(
+            setup_state_box,
+            textvariable=self.setup_next_step_var,
+            bg=Theme.BG_HOVER,
+            fg=Theme.PRIMARY,
+            font=(Theme.FONT_FAMILY, 9, "bold"),
+            anchor="w",
+            justify=tk.LEFT,
+            wraplength=620
+        ).pack(fill=tk.X, pady=(8, 0))
+
+        action_card = self._create_modern_card(right_panel, "日常使用", icon="🚀")
+        action_card["card"].pack(fill=tk.X, pady=(0, 15))
+        control_section = action_card["content"]
 
         # 主控制按钮（大号启动/停止）
         self.toggle_button = tk.Button(
@@ -847,13 +903,12 @@ class ModernTunnelManager(tk.Tk):
         self.toggle_button.bind("<Leave>", lambda e: self._on_toggle_hover(False))
 
         # 次要操作行
-        secondary_actions = tk.Frame(control_section, bg=Theme.BG_MAIN)
+        secondary_actions = tk.Frame(control_section, bg=Theme.BG_CARD)
         secondary_actions.pack(fill=tk.X, pady=(12, 0))
 
-        # 使用更现代的图标按钮
-        self._create_outline_button(secondary_actions, "🌐 DNS路由", self._route_dns_selected)
-        self._create_outline_button(secondary_actions, "✏ 编辑配置", self._edit_selected_config)
-        self._create_outline_button(secondary_actions, "🧪 诊断测试", self._test_tunnel)
+        self._create_outline_button(secondary_actions, "🔄 刷新列表", self.refresh_tunnels)
+        self._create_outline_button(secondary_actions, "➕ 新建隧道", self._create_tunnel)
+        self._create_outline_button(secondary_actions, "🗑 删除隧道", self._delete_selected)
 
         options_card = tk.Frame(
             control_section,
@@ -875,7 +930,7 @@ class ModernTunnelManager(tk.Tk):
 
         persist_cb = tk.Checkbutton(
             options_card,
-            text="关闭应用后保持隧道运行",
+            text="关闭软件后继续保持隧道运行",
             variable=self.persist_var,
             command=self._on_persist_toggle,
             bg=Theme.BG_CARD,
@@ -888,7 +943,7 @@ class ModernTunnelManager(tk.Tk):
 
         autostart_cb = tk.Checkbutton(
             options_card,
-            text="启动应用时自动激活上次隧道",
+            text="打开软件时自动启动当前选择的隧道",
             variable=self.autostart_var,
             command=self._on_autostart_toggle,
             bg=Theme.BG_CARD,
@@ -901,7 +956,7 @@ class ModernTunnelManager(tk.Tk):
 
         autoheal_cb = tk.Checkbutton(
             options_card,
-            text="连接中断时自动重连",
+            text="连接异常时自动重连（高级）",
             variable=self.auto_heal_var,
             command=self._on_auto_heal_toggle,
             bg=Theme.BG_CARD,
@@ -921,6 +976,30 @@ class ModernTunnelManager(tk.Tk):
             wraplength=360,
             justify=tk.LEFT
         ).pack(fill=tk.X, pady=(4, 0))
+
+        advanced_card = self._create_modern_card(right_panel, "高级工具", icon="🧰")
+        advanced_card["card"].pack(fill=tk.X, pady=(0, 15))
+
+        tk.Label(
+            advanced_card["content"],
+            text="只有在需要自定义域名、编辑配置、诊断问题或查看守护进程时才需要使用这些功能。",
+            bg=Theme.BG_CARD,
+            fg=Theme.TEXT_MUTED,
+            font=(Theme.FONT_FAMILY, 9),
+            wraplength=620,
+            justify=tk.LEFT
+        ).pack(anchor="w", pady=(0, 10))
+
+        advanced_row1 = tk.Frame(advanced_card["content"], bg=Theme.BG_CARD)
+        advanced_row1.pack(fill=tk.X)
+        self._create_outline_button(advanced_row1, "🌐 DNS路由", self._route_dns_selected)
+        self._create_outline_button(advanced_row1, "✏ 编辑配置", self._edit_selected_config)
+        self._create_outline_button(advanced_row1, "🧪 诊断测试", self._test_tunnel)
+
+        advanced_row2 = tk.Frame(advanced_card["content"], bg=Theme.BG_CARD)
+        advanced_row2.pack(fill=tk.X, pady=(10, 0))
+        self._create_outline_button(advanced_row2, "📊 守护状态", self._show_supervisor_status)
+        self._create_outline_button(advanced_row2, "📂 打开目录", self._open_config_dir)
 
         # 状态信息卡片
         status_card = self._create_modern_card(right_panel, "系统状态", icon="📊")
@@ -2303,12 +2382,22 @@ class ModernTunnelManager(tk.Tk):
         # 获取当前状态
         cloudflared_path = self.cloudflared_path.get().strip()
         cf_installed = bool(cloudflared_path and Path(cloudflared_path).exists())
+        auth_ready, _, _ = self._cert_status_summary()
         selected = self.tunnel_list.get_selected()
         current_tunnel_name = selected.get("name") if selected else None
         is_running = self._is_tunnel_running(current_tunnel_name) if current_tunnel_name else False
         is_activated = self._is_tunnel_active(current_tunnel_name) if current_tunnel_name else False
         tunnel_count = len(self._tunnels)
         selected_name = selected.get("name", "未选择") if selected else "未选择"
+        manager_text = "守护进程托管" if self._supervisor_active and self._supervisor_available else ("守护进程运行中" if self._supervisor_active else "GUI 直接管理")
+
+        self._refresh_setup_guidance(
+            cloudflared_ready=cf_installed,
+            auth_ready=auth_ready,
+            selected_name=current_tunnel_name,
+            is_running=is_running,
+            is_activated=is_activated,
+        )
 
         # 获取运行的隧道信息
         running_info = ""
@@ -2320,6 +2409,8 @@ class ModernTunnelManager(tk.Tk):
         # 如果状态没有变化，不重新创建widgets（避免闪烁）
         current_state = (
             cf_installed,
+            auth_ready,
+            manager_text,
             current_tunnel_name,
             is_running,
             is_activated,
@@ -2342,6 +2433,20 @@ class ModernTunnelManager(tk.Tk):
             "已就绪" if cf_installed else "未安装",
             "success" if cf_installed else "error",
             "✓" if cf_installed else "✗"
+        )
+        self._set_status_badge(
+            "auth_state",
+            "Cloudflare 认证",
+            "已授权" if auth_ready else "未登录",
+            "success" if auth_ready else "warning",
+            "🔑" if auth_ready else "!"
+        )
+        self._set_status_badge(
+            "control_mode",
+            "控制方式",
+            manager_text,
+            "info" if self._supervisor_active and self._supervisor_available else ("warning" if self._supervisor_active else "default"),
+            "⚙"
         )
         self._set_status_badge(
             "tunnel_state",
@@ -2384,7 +2489,9 @@ class ModernTunnelManager(tk.Tk):
 
         self._status_badges = {
             "cloudflared": self._create_status_badge(row1),
-            "tunnel_state": self._create_status_badge(row1),
+            "auth_state": self._create_status_badge(row1),
+            "control_mode": self._create_status_badge(row1),
+            "tunnel_state": self._create_status_badge(row2),
             "tunnel_count": self._create_status_badge(row2),
             "selected_tunnel": self._create_status_badge(row2),
         }
@@ -2487,6 +2594,41 @@ class ModernTunnelManager(tk.Tk):
             label = "❌ 未找到"
             detail = '未找到 Cloudflare 认证证书 cert.pem，请点击"登录"完成授权。'
         return exists, label, detail
+
+    def _refresh_setup_guidance(
+        self,
+        *,
+        cloudflared_ready: bool,
+        auth_ready: bool,
+        selected_name: str | None,
+        is_running: bool,
+        is_activated: bool,
+    ):
+        """更新面向普通用户的操作引导。"""
+        cloudflared_text = "工具状态：已找到 cloudflared，可直接管理隧道。" if cloudflared_ready else "工具状态：尚未配置 cloudflared，请先下载或选择可执行文件。"
+        auth_text = "登录状态：已检测到 Cloudflare 认证，可新建和管理隧道。" if auth_ready else "登录状态：尚未完成 Cloudflare 授权，先点击“登录授权”。"
+
+        if not cloudflared_ready:
+            next_step = "下一步：先点击“下载/更新”或“选择文件”，完成 cloudflared 准备。"
+        elif not auth_ready:
+            next_step = "下一步：点击“登录授权”，在浏览器中完成 Cloudflare 授权。"
+        elif not self._tunnels:
+            next_step = "下一步：点击“刷新列表”加载已有隧道，或点击“新建隧道”创建一个。"
+        elif not selected_name:
+            next_step = "下一步：从左侧列表选择一个隧道，然后点击“启动”。"
+        elif is_activated:
+            next_step = f"下一步：{selected_name} 已联通，可直接访问已绑定的域名。"
+        elif is_running:
+            next_step = f"下一步：{selected_name} 正在运行，但连接尚未完全建立，可稍等片刻后再访问。"
+        else:
+            next_step = f"下一步：点击“启动”激活 {selected_name}。"
+
+        if self._supervisor_active and self._supervisor_available:
+            next_step += " 当前由守护进程托管，启动/停止会自动转交给后台。"
+
+        self.setup_cloudflared_var.set(cloudflared_text)
+        self.setup_auth_var.set(auth_text)
+        self.setup_next_step_var.set(next_step)
 
     # ========== 功能方法 ==========
 
