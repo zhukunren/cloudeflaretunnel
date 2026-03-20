@@ -1766,34 +1766,118 @@ class ModernTunnelManager(tk.Tk):
         self._immediate_status_sync()
         return True
 
+    def _apply_adopted_running_result(
+        self,
+        tunnel_name: str,
+        result: dict,
+        *,
+        source: str,
+        status_text: str,
+        success_log: str,
+        success_logger: str,
+        failure_message: str,
+        failure_status: str,
+        save_last_selected: bool = False,
+        update_autostart: bool = False,
+        log_persist_target: bool = False,
+    ) -> bool:
+        """接管成功启动的进程；若缺少进程句柄则统一按失败处理。"""
+        adopted = self._adopt_running_tunnel(
+            tunnel_name,
+            result,
+            source=source,
+            status_text=status_text,
+            success_log=success_log,
+            success_logger=success_logger,
+            save_last_selected=save_last_selected,
+            update_autostart=update_autostart,
+            log_persist_target=log_persist_target,
+        )
+        if adopted:
+            return True
+
+        self._record_feedback(failure_message, "error")
+        self.status_var.set(failure_status)
+        return False
+
+    def _record_supervisor_command_acceptance(
+        self,
+        tunnel_name: str,
+        result: dict,
+        *,
+        default_message: str,
+        feedback_prefix: str,
+        logger_prefix: str,
+        status_text: str,
+    ) -> str:
+        """统一记录 supervisor 已接受命令时的状态栏、日志与提示文案。"""
+        msg = self.operation_service.payload_message(result, default_message)
+        feedback_text = f"{feedback_prefix}: {msg or default_message}"
+        self._record_feedback(feedback_text, "success")
+        self.logger.info(f"{logger_prefix} {tunnel_name}: {msg}")
+        self.status_var.set(status_text)
+        return msg
+
+    def _notify_supervisor_result_failure(
+        self,
+        result: dict,
+        *,
+        title: str,
+        default_message: str,
+        log_message: str,
+        status: str | None = None,
+    ):
+        """统一展示 supervisor 返回的失败结果。"""
+        self._append_supervisor_payload_logs(result)
+        message = self.operation_service.payload_message(result, default_message)
+        self._notify_feedback(
+            title,
+            message,
+            tag="error",
+            status=status,
+            log_message=log_message.format(message=message),
+        )
+
+    def _refresh_after_supervisor_command(self, tunnel_name: str | None = None):
+        """在 supervisor 接管操作后同步本地运行态与 UI。"""
+        if tunnel_name:
+            self._clear_tunnel_runtime_state(tunnel_name)
+            self._refresh_proc_state()
+            return
+
+        self._refresh_proc_state()
+        self._immediate_status_sync()
+
     def _handle_start_success_result(self, tunnel_name: str, result: dict) -> bool:
         """处理统一启动结果中的成功分支。"""
         if not result.get("ok"):
             return False
 
-        if self._adopt_running_tunnel(
+        if result.get("managed_by") == "supervisor":
+            self._record_supervisor_command_acceptance(
+                tunnel_name,
+                result,
+                default_message="启动指令已发送",
+                feedback_prefix="守护进程应答",
+                logger_prefix="守护进程启动",
+                status_text="启动指令已发送",
+            )
+            self._refresh_after_supervisor_command()
+            return True
+
+        return self._apply_adopted_running_result(
             tunnel_name,
             result,
             source="gui",
             status_text="隧道 {name} 已激活",
             success_log="隧道 {name} 已启动并激活（协议 {protocol}）",
             success_logger="隧道 {name} 已成功启动并激活，协议 {protocol}",
+            failure_message=f"隧道 {tunnel_name} 启动失败：未获得进程句柄",
+            failure_status="隧道启动失败",
             save_last_selected=True,
             update_autostart=True,
             log_persist_target=True,
-        ):
-            return True
-
-        if result.get("managed_by") == "supervisor":
-            msg = self.operation_service.payload_message(result, "启动指令已发送")
-            self._record_feedback(f"守护进程应答: {msg or '启动指令已发送'}", "success")
-            self.logger.info(f"守护进程启动 {tunnel_name}: {msg}")
-            self.status_var.set("启动指令已发送")
-            self._refresh_proc_state()
-            self._immediate_status_sync()
-            return True
-
-        return False
+        )
 
     def _handle_start_failure_result(self, tunnel_name: str, result: dict) -> bool:
         """处理手动启动流程中的失败结果。"""
@@ -1803,13 +1887,12 @@ class ModernTunnelManager(tk.Tk):
         stage = result.get("stage") or "launch"
         err = result.get("error") or result.get("message") or result.get("detail") or "未知错误"
         if result.get("managed_by") == "supervisor":
-            self._append_supervisor_payload_logs(result)
-            self._notify_feedback(
-                "守护进程启动失败",
-                err,
-                tag="error",
+            self._notify_supervisor_result_failure(
+                result,
+                title="守护进程启动失败",
+                default_message=str(err),
+                log_message="守护进程启动失败: {message}",
                 status="启动失败",
-                log_message=f"守护进程启动失败: {err}",
             )
             return True
 
@@ -1855,8 +1938,8 @@ class ModernTunnelManager(tk.Tk):
             if self._handle_start_success_result(tunnel_name, result):
                 return
 
-            self.status_var.set("隧道启动失败")
             self._record_feedback(f"隧道 {tunnel_name} 启动失败：未获得进程句柄", "error")
+            self.status_var.set("隧道启动失败")
         finally:
             self._unlock_tunnel_operation()
 
@@ -1869,18 +1952,16 @@ class ModernTunnelManager(tk.Tk):
             self.status_var.set("自动重连失败")
             return
 
-        if self._adopt_running_tunnel(
+        self._apply_adopted_running_result(
             tunnel_name,
             result,
             source="auto-heal",
             status_text="隧道 {name} 已激活",
             success_log="隧道 {name} 自动重连成功（协议 {protocol}）",
             success_logger="自动重连成功：{name}，协议 {protocol}",
-        ):
-            return
-
-        self._record_feedback("自动重连失败：未获得进程句柄", "error")
-        self.status_var.set("自动重连失败")
+            failure_message="自动重连失败：未获得进程句柄",
+            failure_status="自动重连失败",
+        )
 
     def _restart_gui_tunnel(self, tunnel_name: str, cloudflared_path: str | None = None, persist_enabled: bool | None = None):
         """在GUI托管模式下安全地重启隧道（后台线程执行重连，避免卡顿）"""
@@ -2800,24 +2881,23 @@ class ModernTunnelManager(tk.Tk):
             return False
 
         ok = bool(result.get("ok"))
-        msg = self.operation_service.payload_message(result, "停止指令已发送" if ok else "守护进程停止失败")
-        if not ok:
-            self._append_supervisor_payload_logs(result)
-
         if ok:
-            self._record_feedback(f"守护进程已执行停止指令: {msg}", "success")
-            self.logger.info(f"守护进程停止 {tunnel_name}: {msg}")
-            self.status_var.set("停止指令已发送")
-            self._clear_tunnel_runtime_state(tunnel_name)
-            self._refresh_proc_state()
-            self._immediate_status_sync()
+            self._record_supervisor_command_acceptance(
+                tunnel_name,
+                result,
+                default_message="停止指令已发送",
+                feedback_prefix="守护进程已执行停止指令",
+                logger_prefix="守护进程停止",
+                status_text="停止指令已发送",
+            )
+            self._refresh_after_supervisor_command(tunnel_name)
             return True
 
-        self._notify_feedback(
-            "停止失败",
-            msg or "守护进程拒绝操作",
-            tag="error",
-            log_message=f"守护进程停止失败: {msg}",
+        self._notify_supervisor_result_failure(
+            result,
+            title="停止失败",
+            default_message="守护进程拒绝操作",
+            log_message="守护进程停止失败: {message}",
         )
         return True
 
