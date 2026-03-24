@@ -14,7 +14,7 @@
 
 ## 环境要求
 - **Windows 10/11** 或 **Linux/Unix 系统**（推荐 Ubuntu 20.04+）
-- Python 3.8+（Windows 需包含 Tkinter）
+- Python 3.8+（默认现代 GUI 使用 PyQt6，未安装时回退 Tk）
 - Cloudflared CLI 工具
 - Linux: Systemd（用于服务管理）
 
@@ -26,10 +26,10 @@
 
 ### 1. 启动 GUI 管理界面
 ```bash
-# 从项目根目录运行（推荐）
+# 从项目根目录运行（推荐，默认 Qt/Win11 风格 GUI）
 python -m app.main
 
-# 经典 UI
+# 强制使用旧版 Tk GUI
 python -m app.main --classic
 
 # Windows: 双击 run.bat 或
@@ -102,18 +102,13 @@ scripts\windows\setup_autostart.bat status supervisor
     └── persistent/          # 持久化日志
 
 ## GUI 使用说明
-- 普通用户建议路径：
-  1. 在“首次使用”区域完成 `下载/更新` 或 `选择文件`
-  2. 点击 `登录授权`
-  3. 刷新列表或新建隧道
-  4. 选择隧道后直接点击 `启动`
-  5. 只有在需要排障或自定义域名时，再进入“高级工具”
+- 默认现代 GUI：PyQt6 Win11 风格紧凑布局
 - 刷新：列出当前账户下的隧道
 - 下载：自动下载 cloudflared（Windows/架构自动匹配）
 - 新建隧道：输入名称后创建
-- 编辑配置：为选中隧道生成/打开 `tunnels/<name>/config.yml`
+- 编辑配置：打开 `tunnels/<name>/config.yml` 的纯 YAML 编辑器并支持校验/保存
+- DNS 路由：按配置在启动时自动补齐
 - 启动/停止：基于该配置启动或停止隧道进程
-- DNS 路由：一键为选中隧道绑定域名（创建 Cloudflare DNS 记录）
 - 删除选中：删除远端隧道（不可恢复）
 - 守护进程配合：如果系统已启用 `tunnel_supervisor.service`，GUI 会自动把“启动/停止”请求交给守护进程执行，普通用户无需打开终端即可管理所有隧道。
 
